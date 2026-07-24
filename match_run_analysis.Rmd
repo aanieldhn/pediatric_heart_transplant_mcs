@@ -1,0 +1,4578 @@
+---
+title: "Match Run Analysis"
+output: html_document
+date: "2026-05-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+library(tidyverse)
+library(lubridate)
+library(survival)
+library(coxme)
+library(tidycmprsk)
+library(cmprsk)
+library(ggsurvfit)
+library(patchwork)
+library(broom)
+library(data.table)
+library(purrr)
+library(timeROC)
+
+```
+
+
+``` {r load datasets}
+#This chunk is not necessary if you have already loaded the datasets from the other RMD. 
+thoracic_wlhistory_data = read_sas("~/Desktop/R Project Data/HRStatJust2509DanielAhn/thoracic_wlhistory_data", NULL)
+
+thoracic_data = read_sas("~/Desktop/R Project Data/HRStatJust2509DanielAhn/thoracic_data", NULL)
+
+thoracic_stat1a = read_sas("~/Desktop/R Project Data/HRStatJust2509DanielAhn/thoracic_stat1a", NULL)
+
+thoracic_stat1b = read_sas("~/Desktop/R Project Data/HRStatJust2509DanielAhn/thoracic_stat1b", NULL)
+
+thoracic_mcs_device = read_sas("~/Desktop/R Project Data/HRStatJust2509DanielAhn/thoracic_mcs_device", NULL)
+
+ptr_hrhl = read_sas("~/Desktop/R Project Data/HRStatJust2509DanielAhn/ptr_hrhl", NULL)
+
+
+```
+
+``` {r time-dependent auc analysis}
+
+
+# ── Step 1: Snapshot dates ────────────────────────────────────────
+snap_dates_auc <- seq.Date(
+  as.Date("2016-04-01"),
+  as.Date("2024-10-01"),
+  by = "3 months"
+)
+
+cat("Number of snapshots:", length(snap_dates_auc), "\n")
+
+
+# ── Step 2: Status history — Status 1A only ───────────────────────
+status_hx_auc <- ped_hx_snap %>%
+  filter(
+    WL_ID_CODE %in% analytic_era_2025$WL_ID_CODE,
+    UNOS_CAND_STAT_CD == 2010
+  ) %>%
+  mutate(
+    CHG_DATE     = as.Date(CHG_DATE),
+    CHG_END_DATE = as.Date(CHG_END_DATE)
+  ) %>%
+  dplyr::select(
+    WL_ID_CODE,
+    CHG_DATE,
+    CHG_END_DATE
+  )
+
+
+# ── Step 3: ECMO data ─────────────────────────────────────────────
+ecmo_snap <- thoracic_mcs_device %>%
+  filter(
+    WL_ID_CODE %in% analytic_era_2025$WL_ID_CODE,
+    DEVICE_TYPE %in% c("ECMO", "VA ECMO", "VV ECMO")
+  ) %>%
+  mutate(
+    IMPLANT_DATE = as.Date(IMPLANT_DATE),
+    EXPLANT_DATE = as.Date(EXPLANT_DATE)
+  ) %>%
+  dplyr::select(
+    WL_ID_CODE,
+    IMPLANT_DATE,
+    EXPLANT_DATE
+  )
+
+
+# ── Step 4: Ventilation data ──────────────────────────────────────
+vent_snap <- thoracic_stat1a %>%
+  filter(
+    WL_ID_CODE %in% analytic_era_2025$WL_ID_CODE,
+    !is.na(REQ1_CONTINUOUS_VENTILATION)
+  ) %>%
+  mutate(
+    UPGRADE_EXTDATE = as.Date(UPGRADE_EXTDATE)
+  ) %>%
+  dplyr::select(
+    WL_ID_CODE,
+    UPGRADE_EXTDATE,
+    REQ1_CONTINUOUS_VENTILATION
+  ) %>%
+  arrange(
+    WL_ID_CODE,
+    UPGRADE_EXTDATE
+  )
+
+
+# ── Step 4b: Reconstruct ventilation episodes ────────────────────
+vent_episodes <- vent_snap %>%
+  group_by(WL_ID_CODE) %>%
+  arrange(
+    UPGRADE_EXTDATE,
+    .by_group = TRUE
+  ) %>%
+  mutate(
+    vent_on       = as.integer(REQ1_CONTINUOUS_VENTILATION == 1),
+    prev_vent     = lag(vent_on, default = 0L),
+    episode_start = vent_on == 1 & prev_vent == 0,
+    episode_id    = cumsum(episode_start) * vent_on
+  ) %>%
+  filter(vent_on == 1) %>%
+  group_by(
+    WL_ID_CODE,
+    episode_id
+  ) %>%
+  summarise(
+    vent_start = min(UPGRADE_EXTDATE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    vent_snap %>%
+      filter(REQ1_CONTINUOUS_VENTILATION != 1) %>%
+      dplyr::select(
+        WL_ID_CODE,
+        vent_off_date = UPGRADE_EXTDATE
+      ),
+    by = "WL_ID_CODE",
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    is.na(vent_off_date) |
+      vent_off_date > vent_start
+  ) %>%
+  group_by(
+    WL_ID_CODE,
+    episode_id,
+    vent_start
+  ) %>%
+  summarise(
+    vent_end = if (
+      all(is.na(vent_off_date))
+    ) {
+      as.Date(NA)
+    } else {
+      min(vent_off_date, na.rm = TRUE)
+    },
+    .groups = "drop"
+  ) %>%
+  dplyr::select(
+    WL_ID_CODE,
+    vent_start,
+    vent_end
+  )
+
+
+# ── Step 5: Outcomes ──────────────────────────────────────────────
+outcomes_auc <- analytic_era_2025 %>%
+  dplyr::select(
+    WL_ID_CODE,
+    END_DATE,
+    death
+  ) %>%
+  mutate(
+    END_DATE = as.Date(END_DATE)
+  )
+
+
+# ── Step 6: Interval union helper ─────────────────────────────────
+union_days <- function(starts, ends) {
+  
+  if (length(starts) == 0) {
+    return(0)
+  }
+  
+  ord <- order(starts)
+  
+  starts <- starts[ord]
+  ends   <- ends[ord]
+  
+  total     <- 0
+  cur_start <- starts[1]
+  cur_end   <- ends[1]
+  
+  if (length(starts) > 1) {
+    
+    for (i in 2:length(starts)) {
+      
+      if (starts[i] <= cur_end) {
+        
+        cur_end <- max(
+          cur_end,
+          ends[i]
+        )
+        
+      } else {
+        
+        total <- total +
+          as.numeric(cur_end - cur_start)
+        
+        cur_start <- starts[i]
+        cur_end   <- ends[i]
+      }
+    }
+  }
+  
+  total <- total +
+    as.numeric(cur_end - cur_start)
+  
+  total
+}
+
+
+# ── Step 7: Analysis horizon ──────────────────────────────────────
+auc_horizon <- 90
+
+# timeROC requires some controls to have follow-up strictly greater
+# than the evaluation time. Candidates known to be event-free through
+# day 90 are therefore assigned administrative follow-up just beyond
+# day 90.
+admin_time <- auc_horizon + 0.01
+
+
+# ── Step 8: Build snapshot dataset ────────────────────────────────
+cat("Building AUC snapshot dataset (Status 1A only)...\n")
+
+auc_snap_data <- lapply(
+  snap_dates_auc,
+  function(dt) {
+    
+    # ── Active Status 1A candidates ───────────────────────────────
+    active_1a <- status_hx_auc %>%
+      filter(
+        CHG_DATE <= dt,
+        is.na(CHG_END_DATE) |
+          CHG_END_DATE > dt
+      ) %>%
+      distinct(WL_ID_CODE)
+    
+    if (nrow(active_1a) < 10) {
+      return(NULL)
+    }
+    
+    
+    # ── Total cumulative active Status 1A waiting time ────────────
+    wt_at_snap <- status_hx_auc %>%
+      filter(
+        WL_ID_CODE %in% active_1a$WL_ID_CODE,
+        CHG_DATE <= dt
+      ) %>%
+      mutate(
+        period_end = if_else(
+          is.na(CHG_END_DATE) |
+            CHG_END_DATE > dt,
+          dt,
+          CHG_END_DATE
+        ),
+        days_counted = as.numeric(
+          period_end - CHG_DATE
+        )
+      ) %>%
+      filter(days_counted > 0) %>%
+      group_by(WL_ID_CODE) %>%
+      summarise(
+        wait_days = sum(
+          days_counted,
+          na.rm = TRUE
+        ),
+        .groups = "drop"
+      )
+    
+    
+    # ── Status 1A intervals clipped to snapshot ───────────────────
+    status1a_intervals <- status_hx_auc %>%
+      filter(
+        WL_ID_CODE %in% active_1a$WL_ID_CODE,
+        CHG_DATE <= dt
+      ) %>%
+      transmute(
+        WL_ID_CODE,
+        status_start = CHG_DATE,
+        status_end = if_else(
+          is.na(CHG_END_DATE) |
+            CHG_END_DATE > dt,
+          dt,
+          CHG_END_DATE
+        )
+      ) %>%
+      filter(status_end > status_start)
+    
+    
+    # ── ECMO intervals and current ECMO flag ──────────────────────
+    ecmo_at_snap <- ecmo_snap %>%
+      filter(
+        WL_ID_CODE %in% active_1a$WL_ID_CODE,
+        IMPLANT_DATE <= dt
+      ) %>%
+      mutate(
+        eff_end = if_else(
+          is.na(EXPLANT_DATE) |
+            EXPLANT_DATE > dt,
+          dt,
+          EXPLANT_DATE
+        ),
+        still_on = (
+          is.na(EXPLANT_DATE) |
+            EXPLANT_DATE > dt
+        )
+      )
+    
+    ecmo_flag <- ecmo_at_snap %>%
+      group_by(WL_ID_CODE) %>%
+      summarise(
+        on_ecmo = as.integer(
+          any(still_on)
+        ),
+        .groups = "drop"
+      )
+    
+    ecmo_intervals <- ecmo_at_snap %>%
+      transmute(
+        WL_ID_CODE,
+        start = IMPLANT_DATE,
+        end   = eff_end
+      ) %>%
+      filter(end > start)
+    
+    
+    # ── Current ventilation flag ──────────────────────────────────
+    vent_at_snap <- vent_snap %>%
+      filter(
+        WL_ID_CODE %in% active_1a$WL_ID_CODE,
+        UPGRADE_EXTDATE <= dt
+      ) %>%
+      group_by(WL_ID_CODE) %>%
+      slice_max(
+        UPGRADE_EXTDATE,
+        n = 1,
+        with_ties = FALSE
+      ) %>%
+      ungroup() %>%
+      mutate(
+        on_vent = as.integer(
+          REQ1_CONTINUOUS_VENTILATION == 1
+        )
+      ) %>%
+      dplyr::select(
+        WL_ID_CODE,
+        on_vent
+      )
+    
+    
+    # ── Historical ventilation intervals clipped to snapshot ─────
+    vent_intervals <- vent_episodes %>%
+      filter(
+        WL_ID_CODE %in% active_1a$WL_ID_CODE,
+        vent_start <= dt
+      ) %>%
+      transmute(
+        WL_ID_CODE,
+        start = vent_start,
+        end = if_else(
+          is.na(vent_end) |
+            vent_end > dt,
+          dt,
+          vent_end
+        )
+      ) %>%
+      filter(end > start)
+    
+    
+    # ── ECMO or ventilation intervals ─────────────────────────────
+    support_intervals <- bind_rows(
+      ecmo_intervals,
+      vent_intervals
+    ) %>%
+      filter(end > start)
+    
+    
+    # ── New Status 1 intervals ────────────────────────────────────
+    # New Status 1 requires simultaneous:
+    # Status 1A AND (ECMO OR mechanical ventilation).
+    ns1_intervals <- support_intervals %>%
+      inner_join(
+        status1a_intervals,
+        by = "WL_ID_CODE",
+        relationship = "many-to-many"
+      ) %>%
+      filter(
+        start < status_end,
+        status_start < end
+      ) %>%
+      transmute(
+        WL_ID_CODE,
+        start = pmax(
+          start,
+          status_start
+        ),
+        end = pmin(
+          end,
+          status_end
+        )
+      ) %>%
+      filter(end > start)
+    
+    
+    # ── Total nonoverlapping New Status 1 waiting time ─────────────
+    ns1_union <- ns1_intervals %>%
+      group_by(WL_ID_CODE) %>%
+      summarise(
+        ns1_days = union_days(
+          start,
+          end
+        ),
+        .groups = "drop"
+      )
+    
+    
+    # ── Combine snapshot data ─────────────────────────────────────
+    snap_df <- active_1a %>%
+      left_join(
+        wt_at_snap,
+        by = "WL_ID_CODE"
+      ) %>%
+      left_join(
+        ecmo_flag,
+        by = "WL_ID_CODE"
+      ) %>%
+      left_join(
+        vent_at_snap,
+        by = "WL_ID_CODE"
+      ) %>%
+      left_join(
+        ns1_union,
+        by = "WL_ID_CODE"
+      ) %>%
+      mutate(
+        on_ecmo   = replace_na(on_ecmo, 0L),
+        on_vent   = replace_na(on_vent, 0L),
+        wait_days = replace_na(wait_days, 0),
+        ns1_days  = replace_na(ns1_days, 0),
+        
+        new_status1 = as.integer(
+          on_ecmo == 1 |
+            on_vent == 1
+        ),
+        
+        ns2_days = pmax(
+          wait_days - ns1_days,
+          0
+        ),
+        
+        wait_days_tier = if_else(
+          new_status1 == 1,
+          ns1_days,
+          ns2_days
+        )
+      )
+    
+    
+    # ── Current-system rank ───────────────────────────────────────
+    snap_df <- snap_df %>%
+      arrange(
+        desc(wait_days),
+        WL_ID_CODE
+      ) %>%
+      mutate(
+        rank_current = row_number()
+      )
+    
+    
+    # ── Counterfactual rank ───────────────────────────────────────
+    snap_df <- snap_df %>%
+      arrange(
+        desc(new_status1),
+        desc(wait_days_tier),
+        WL_ID_CODE
+      ) %>%
+      mutate(
+        rank_cf = row_number()
+      )
+    
+    
+    # ── Outcomes after each snapshot ──────────────────────────────
+    snap_df <- snap_df %>%
+      left_join(
+        outcomes_auc,
+        by = "WL_ID_CODE"
+      ) %>%
+      mutate(
+        time_to_removal = as.numeric(
+          END_DATE - dt
+        ),
+        
+        observed_time = case_when(
+          is.na(time_to_removal) ~ NA_real_,
+          time_to_removal < 0   ~ NA_real_,
+          time_to_removal == 0  ~ 0.5,
+          TRUE                  ~ time_to_removal
+        ),
+        
+        # Death or removal for deterioration through day 90.
+        event_90 = as.integer(
+          death == 1 &
+            !is.na(observed_time) &
+            observed_time <= auc_horizon
+        ),
+        
+        # Event through day 90:
+        # retain the actual event time.
+        #
+        # Transplant or other censoring before day 90:
+        # retain the actual censoring time.
+        #
+        # Event-free through day 90:
+        # assign follow-up just beyond day 90 so timeROC can identify
+        # controls at t = 90.
+        time_days_90 = case_when(
+          event_90 == 1 ~ observed_time,
+          
+          !is.na(observed_time) &
+            observed_time <= auc_horizon ~ observed_time,
+          
+          TRUE ~ admin_time
+        ),
+        
+        snapshot_date = dt
+      ) %>%
+      filter(
+        !is.na(time_days_90)
+      )
+    
+    snap_df
+  }
+) %>%
+  bind_rows()
+
+
+# ── Step 9: Snapshot summary ──────────────────────────────────────
+cat("\nSnapshot dataset summary:\n")
+
+cat(
+  "Total rows:",
+  nrow(auc_snap_data),
+  "\n"
+)
+
+cat(
+  "Total events:",
+  sum(auc_snap_data$event_90),
+  "\n"
+)
+
+cat(
+  "Unique candidates:",
+  n_distinct(auc_snap_data$WL_ID_CODE),
+  "\n"
+)
+
+cat(
+  "Snapshots with data:",
+  n_distinct(auc_snap_data$snapshot_date),
+  "\n"
+)
+
+cat(
+  "Event rate:",
+  round(
+    mean(auc_snap_data$event_90) * 100,
+    1
+  ),
+  "%\n"
+)
+
+cat(
+  "\nNew Status 1 rows:",
+  sum(auc_snap_data$new_status1),
+  sprintf(
+    "(%.1f%%)\n",
+    mean(auc_snap_data$new_status1) * 100
+  )
+)
+
+cat("\nTier-specific waiting time summary:\n")
+
+auc_snap_data %>%
+  group_by(new_status1) %>%
+  summarise(
+    n         = n(),
+    median_wt = median(wait_days_tier),
+    mean_wt   = round(
+      mean(wait_days_tier),
+      1
+    ),
+    .groups = "drop"
+  ) %>%
+  print()
+
+
+# ── Step 10: Verify 90-day risk-set construction ──────────────────
+cat(
+  "\nEvents by 90 days:",
+  sum(auc_snap_data$event_90 == 1),
+  "\n"
+)
+
+cat(
+  "Controls observed beyond 90 days:",
+  sum(
+    auc_snap_data$event_90 == 0 &
+      auc_snap_data$time_days_90 > auc_horizon
+  ),
+  "\n"
+)
+
+cat(
+  "Censored before or at 90 days:",
+  sum(
+    auc_snap_data$event_90 == 0 &
+      auc_snap_data$time_days_90 <= auc_horizon
+  ),
+  "\n"
+)
+
+
+# ── Step 11: Time-dependent AUC at exactly 90 days ────────────────
+cat("\nComputing time-dependent AUC...\n")
+
+auc_current <- timeROC(
+  T         = auc_snap_data$time_days_90,
+  delta     = auc_snap_data$event_90,
+  marker    = -auc_snap_data$rank_current,
+  cause     = 1,
+  weighting = "marginal",
+  times     = auc_horizon,
+  iid       = TRUE
+)
+
+auc_cf <- timeROC(
+  T         = auc_snap_data$time_days_90,
+  delta     = auc_snap_data$event_90,
+  marker    = -auc_snap_data$rank_cf,
+  cause     = 1,
+  weighting = "marginal",
+  times     = auc_horizon,
+  iid       = TRUE
+)
+
+
+auc_index_current <- which(
+  auc_current$times == auc_horizon
+)
+
+auc_index_cf <- which(
+  auc_cf$times == auc_horizon
+)
+
+if (
+  length(auc_index_current) != 1 ||
+  length(auc_index_cf) != 1
+) {
+  stop(
+    "Could not uniquely identify the requested 90-day AUC."
+  )
+}
+
+
+auc_current_90 <- auc_current$AUC[
+  auc_index_current
+]
+
+auc_cf_90 <- auc_cf$AUC[
+  auc_index_cf
+]
+
+
+cat("\n=== TIME-DEPENDENT AUC AT 90 DAYS ===\n")
+
+cat(
+  "Current System AUC:          ",
+  round(auc_current_90, 3),
+  "\n"
+)
+
+cat(
+  "4-Status Counterfactual AUC: ",
+  round(auc_cf_90, 3),
+  "\n"
+)
+
+cat(
+  "AUC difference (CF - Current):",
+  round(
+    auc_cf_90 - auc_current_90,
+    3
+  ),
+  "\n"
+)
+
+
+# ── Step 12: Candidate-clustered bootstrap ────────────────────────
+set.seed(42)
+
+n_boot     <- 1000
+unique_ids <- unique(
+  auc_snap_data$WL_ID_CODE
+)
+
+cat(
+  "Unique candidates to resample:",
+  length(unique_ids),
+  "\n"
+)
+
+cat(
+  "Running clustered bootstrap (n =",
+  n_boot,
+  ")...\n"
+)
+
+
+auc_dt <- as.data.table(
+  auc_snap_data
+)
+
+setkey(
+  auc_dt,
+  WL_ID_CODE
+)
+
+
+boot_results <- vector(
+  "list",
+  n_boot
+)
+
+boot_errors <- character(
+  n_boot
+)
+
+pb <- txtProgressBar(
+  min = 0,
+  max = n_boot,
+  style = 3
+)
+
+
+for (i in seq_len(n_boot)) {
+  
+  tryCatch({
+    
+    boot_ids <- sample(
+      unique_ids,
+      length(unique_ids),
+      replace = TRUE
+    )
+    
+    id_dt <- data.table(
+      WL_ID_CODE = boot_ids,
+      boot_row = seq_along(boot_ids)
+    )
+    
+    boot_dat <- auc_dt[
+      id_dt,
+      on = "WL_ID_CODE",
+      allow.cartesian = TRUE
+    ]
+    
+    if (sum(boot_dat$event_90) < 5) {
+      boot_errors[i] <- "Fewer than 5 events"
+      next
+    }
+    
+    
+    roc_curr <- timeROC(
+      T         = boot_dat$time_days_90,
+      delta     = boot_dat$event_90,
+      marker    = -boot_dat$rank_current,
+      cause     = 1,
+      weighting = "marginal",
+      times     = auc_horizon,
+      iid       = FALSE
+    )
+    
+    roc_cf <- timeROC(
+      T         = boot_dat$time_days_90,
+      delta     = boot_dat$event_90,
+      marker    = -boot_dat$rank_cf,
+      cause     = 1,
+      weighting = "marginal",
+      times     = auc_horizon,
+      iid       = FALSE
+    )
+    
+    
+    curr_idx <- which(
+      roc_curr$times == auc_horizon
+    )
+    
+    cf_idx <- which(
+      roc_cf$times == auc_horizon
+    )
+    
+    if (
+      length(curr_idx) != 1 ||
+      length(cf_idx) != 1
+    ) {
+      stop(
+        "Could not uniquely identify the requested bootstrap AUC."
+      )
+    }
+    
+    
+    boot_results[[i]] <- tibble(
+      auc_current = roc_curr$AUC[curr_idx],
+      auc_cf      = roc_cf$AUC[cf_idx],
+      auc_diff    = roc_cf$AUC[cf_idx] -
+        roc_curr$AUC[curr_idx]
+    )
+    
+  }, error = function(e) {
+    
+    boot_errors[i] <<- conditionMessage(e)
+    
+  })
+  
+  setTxtProgressBar(
+    pb,
+    i
+  )
+}
+
+
+close(pb)
+
+
+boot_clean <- bind_rows(
+  boot_results
+)
+
+cat(
+  "\nSuccessful iterations:",
+  nrow(boot_clean),
+  "/",
+  n_boot,
+  "\n"
+)
+
+
+if (nrow(boot_clean) < 0.95 * n_boot) {
+  
+  warning(
+    paste0(
+      "Fewer than 95% of bootstrap iterations succeeded: ",
+      nrow(boot_clean),
+      " of ",
+      n_boot,
+      "."
+    )
+  )
+}
+
+
+if (any(nzchar(boot_errors))) {
+  
+  cat("\nBootstrap failure reasons:\n")
+  
+  print(
+    sort(
+      table(
+        boot_errors[nzchar(boot_errors)]
+      ),
+      decreasing = TRUE
+    )
+  )
+}
+
+
+# ── Step 13: Bootstrap results ────────────────────────────────────
+cat("\n=== BOOTSTRAP RESULTS ===\n")
+
+
+cat("\nCurrent System AUC:\n")
+
+cat(
+  "  Point estimate:",
+  round(auc_current_90, 3),
+  "\n"
+)
+
+cat(
+  "  Bootstrap mean:",
+  round(
+    mean(
+      boot_clean$auc_current,
+      na.rm = TRUE
+    ),
+    3
+  ),
+  "\n"
+)
+
+cat(
+  "  95% CI:        ",
+  round(
+    quantile(
+      boot_clean$auc_current,
+      0.025,
+      na.rm = TRUE
+    ),
+    3
+  ),
+  "-",
+  round(
+    quantile(
+      boot_clean$auc_current,
+      0.975,
+      na.rm = TRUE
+    ),
+    3
+  ),
+  "\n"
+)
+
+
+cat("\n4-Status Counterfactual AUC:\n")
+
+cat(
+  "  Point estimate:",
+  round(auc_cf_90, 3),
+  "\n"
+)
+
+cat(
+  "  Bootstrap mean:",
+  round(
+    mean(
+      boot_clean$auc_cf,
+      na.rm = TRUE
+    ),
+    3
+  ),
+  "\n"
+)
+
+cat(
+  "  95% CI:        ",
+  round(
+    quantile(
+      boot_clean$auc_cf,
+      0.025,
+      na.rm = TRUE
+    ),
+    3
+  ),
+  "-",
+  round(
+    quantile(
+      boot_clean$auc_cf,
+      0.975,
+      na.rm = TRUE
+    ),
+    3
+  ),
+  "\n"
+)
+
+
+cat("\nAUC difference (CF - Current):\n")
+
+cat(
+  "  Point estimate:",
+  round(
+    auc_cf_90 - auc_current_90,
+    3
+  ),
+  "\n"
+)
+
+cat(
+  "  Bootstrap mean:",
+  round(
+    mean(
+      boot_clean$auc_diff,
+      na.rm = TRUE
+    ),
+    3
+  ),
+  "\n"
+)
+
+cat(
+  "  95% CI:        ",
+  round(
+    quantile(
+      boot_clean$auc_diff,
+      0.025,
+      na.rm = TRUE
+    ),
+    3
+  ),
+  "-",
+  round(
+    quantile(
+      boot_clean$auc_diff,
+      0.975,
+      na.rm = TRUE
+    ),
+    3
+  ),
+  "\n"
+)
+
+cat(
+  "  p-value (H0: diff = 0):",
+  round(
+    mean(
+      boot_clean$auc_diff <= 0,
+      na.rm = TRUE
+    ),
+    4
+  ),
+  "\n"
+)
+
+```
+
+
+
+
+``` {r match run analysis setup}
+cat("Columns in thoracic_stat1a:\n")
+colnames(thoracic_stat1a) %>% print()
+
+cat("\nREQ1_CONTINUOUS_VENTILATION distribution:\n")
+thoracic_stat1a %>%
+  count(REQ1_CONTINUOUS_VENTILATION) %>%
+  print()
+
+cat("\nDate field:\n")
+thoracic_stat1a %>%
+  dplyr::select(
+    WL_ID_CODE,
+    UPGRADE_EXTDATE,
+    REQ1_CONTINUOUS_VENTILATION
+  ) %>%
+  head(5) %>%
+  print()
+
+
+# ── Full pediatric candidate pool ─────────────────────────────────
+all_ped_ids <- thoracic_data %>%
+  filter(
+    WL_ORG == "HR",
+    INIT_AGE < 18,
+    as.Date(INIT_DATE) <= as.Date("2024-12-31")
+  ) %>%
+  distinct(WL_ID_CODE)
+
+
+# ── Overlap with PTR pediatric candidates ────────────────────────
+ptr_ped_ids <- ptr_hrhl %>%
+  filter(
+    WL_ID_CODE %in% all_ped_ids$WL_ID_CODE
+  ) %>%
+  distinct(WL_ID_CODE)
+
+cat(
+  "\nPediatric candidates in ptr_hrhl:",
+  nrow(ptr_ped_ids),
+  "\n"
+)
+
+cat("With ventilation forms in thoracic_stat1a:\n")
+
+thoracic_stat1a %>%
+  filter(
+    WL_ID_CODE %in% ptr_ped_ids$WL_ID_CODE
+  ) %>%
+  summarise(
+    n_rows = n(),
+    n_candidates = n_distinct(WL_ID_CODE),
+    n_ever_vent = n_distinct(
+      WL_ID_CODE[
+        REQ1_CONTINUOUS_VENTILATION == 1
+      ]
+    )
+  ) %>%
+  print()
+
+cat("\nREQ5_CIRCULATORY_DEVICE (MCS flag):\n")
+
+thoracic_stat1a %>%
+  filter(
+    WL_ID_CODE %in% ptr_ped_ids$WL_ID_CODE
+  ) %>%
+  count(REQ5_CIRCULATORY_DEVICE) %>%
+  print()
+
+
+# ── Step 1: Add donor age to PTR study data ──────────────────────
+ptr_study <- ptr_hrhl %>%
+  filter(
+    WL_ORG %in% c("HR", "HL"),
+    as.Date(MATCH_SUBMIT_DT) >= as.Date("2019-01-01"),
+    as.Date(MATCH_SUBMIT_DT) <= as.Date("2024-12-31")
+  ) %>%
+  mutate(
+    MATCH_SUBMIT_DT = as.Date(MATCH_SUBMIT_DT)
+  ) %>%
+  left_join(
+    deceased_donor_data %>%
+      dplyr::select(
+        DONOR_ID,
+        AGE_DON,
+        ABO_DON
+      ),
+    by = "DONOR_ID"
+  ) %>%
+  mutate(
+    is_adult_donor = !is.na(AGE_DON) & AGE_DON >= 18,
+    is_ped_donor   = !is.na(AGE_DON) & AGE_DON < 18,
+    class_prefix = as.numeric(
+      gsub(
+        "-.*",
+        "",
+        trimws(CLASS_ID)
+      )
+    )
+  )
+
+
+# ── Step 2: Keep match runs containing any pediatric candidate ───
+cat(
+  "Total pediatric HR candidates (all years):",
+  nrow(all_ped_ids),
+  "\n"
+)
+
+ptr_ped_runs <- ptr_study %>%
+  group_by(MATCH_ID_CODE) %>%
+  filter(
+    any(
+      WL_ID_CODE %in% all_ped_ids$WL_ID_CODE
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    is_ped_candidate =
+      WL_ID_CODE %in% all_ped_ids$WL_ID_CODE
+  )
+
+cat(
+  "Match runs with any ped candidate:",
+  n_distinct(ptr_ped_runs$MATCH_ID_CODE),
+  "\n"
+)
+
+cat(
+  "Pediatric candidate rows:",
+  sum(ptr_ped_runs$is_ped_candidate),
+  "\n"
+)
+
+cat(
+  "Total rows on these match runs:",
+  nrow(ptr_ped_runs),
+  "\n"
+)
+
+
+# ── Step 3: Flag pediatric Status 1A classifications ──────────────
+# Rows with missing donor age cannot be assigned to an adult- or
+# pediatric-donor classification family.
+
+ped_1a_adult_donor_prefixes <- c(
+  100, 200, 700, 800, 2100, 2200,
+  3300, 3400, 4500, 4600
+)
+
+ped_1a_ped_donor_prefixes <- c(
+  100, 200, 2900, 3000, 5100, 5200,
+  6900, 7000, 8700, 8800
+)
+
+ptr_ped_runs <- ptr_ped_runs %>%
+  mutate(
+    is_ped_1a_class = case_when(
+      is_adult_donor &
+        class_prefix %in%
+        ped_1a_adult_donor_prefixes ~ TRUE,
+      
+      is_ped_donor &
+        class_prefix %in%
+        ped_1a_ped_donor_prefixes ~ TRUE,
+      
+      TRUE ~ FALSE
+    )
+  )
+
+cat("\nPed 1A classification check:\n")
+
+ptr_ped_runs %>%
+  filter(is_ped_candidate) %>%
+  count(is_ped_1a_class) %>%
+  print()
+
+
+# ── Step 4: Build current ventilation flag ───────────────────────
+
+ped_on_runs <- ptr_ped_runs %>%
+  filter(is_ped_candidate) %>%
+  dplyr::select(
+    MATCH_ID_CODE,
+    WL_ID_CODE,
+    MATCH_SUBMIT_DT,
+    PTR_SEQUENCE_NUM,
+    class_prefix,
+    is_ped_1a_class,
+    is_adult_donor,
+    is_ped_donor
+  ) %>%
+  as_tibble()
+
+vent_tv <- thoracic_stat1a %>%
+  filter(
+    WL_ID_CODE %in% all_ped_ids$WL_ID_CODE,
+    !is.na(REQ1_CONTINUOUS_VENTILATION)
+  ) %>%
+  mutate(
+    UPGRADE_EXTDATE = as.Date(UPGRADE_EXTDATE)
+  ) %>%
+  dplyr::select(
+    WL_ID_CODE,
+    UPGRADE_EXTDATE,
+    REQ1_CONTINUOUS_VENTILATION
+  ) %>%
+  arrange(
+    WL_ID_CODE,
+    UPGRADE_EXTDATE
+  )
+
+cat("Adding ventilation flags...\n")
+
+# Preserve every pediatric candidate-match-run observation.
+# When a candidate has forms, but all forms occur after the match-run date,
+# the candidate is treated as not ventilated at that match-run date.
+vent_at_match <- ped_on_runs %>%
+  left_join(
+    vent_tv,
+    by = "WL_ID_CODE",
+    relationship = "many-to-many"
+  ) %>%
+  mutate(
+    eligible_form =
+      !is.na(UPGRADE_EXTDATE) &
+      UPGRADE_EXTDATE <= MATCH_SUBMIT_DT
+  ) %>%
+  group_by(
+    MATCH_ID_CODE,
+    WL_ID_CODE,
+    MATCH_SUBMIT_DT,
+    PTR_SEQUENCE_NUM
+  ) %>%
+  arrange(
+    desc(eligible_form),
+    desc(UPGRADE_EXTDATE),
+    .by_group = TRUE
+  ) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(
+    on_vent_raw = case_when(
+      eligible_form ~
+        as.integer(REQ1_CONTINUOUS_VENTILATION == 1),
+      TRUE ~ 0L
+    ),
+    on_vent = if_else(
+      is_ped_1a_class,
+      on_vent_raw,
+      0L
+    )
+  ) %>%
+  dplyr::select(
+    MATCH_ID_CODE,
+    WL_ID_CODE,
+    MATCH_SUBMIT_DT,
+    PTR_SEQUENCE_NUM,
+    class_prefix,
+    is_ped_1a_class,
+    is_adult_donor,
+    is_ped_donor,
+    on_vent
+  )
+
+cat(
+  "Pediatric match-run rows before ventilation assignment:",
+  nrow(ped_on_runs),
+  "\n"
+)
+
+cat(
+  "Pediatric match-run rows after ventilation assignment:",
+  nrow(vent_at_match),
+  "\n"
+)
+
+if (nrow(vent_at_match) != nrow(ped_on_runs)) {
+  stop("Ventilation assignment lost pediatric match-run rows.")
+}
+
+cat(
+  "Ventilated pediatric rows:",
+  sum(vent_at_match$on_vent == 1),
+  "\n"
+)
+
+cat(
+  "Nonventilated pediatric rows:",
+  sum(vent_at_match$on_vent == 0),
+  "\n"
+)
+
+
+# ── Step 5: Build current ECMO flag ───────────────────────────────
+
+ecmo_tv <- thoracic_mcs_device %>%
+  filter(
+    WL_ID_CODE %in% all_ped_ids$WL_ID_CODE,
+    DEVICE_TYPE %in% c(
+      "ECMO",
+      "VA ECMO",
+      "VV ECMO"
+    )
+  ) %>%
+  mutate(
+    IMPLANT_DATE = as.Date(IMPLANT_DATE),
+    EXPLANT_DATE = as.Date(EXPLANT_DATE)
+  ) %>%
+  dplyr::select(
+    WL_ID_CODE,
+    IMPLANT_DATE,
+    EXPLANT_DATE
+  )
+
+ecmo_at_match <- ped_on_runs %>%
+  left_join(
+    ecmo_tv,
+    by = "WL_ID_CODE",
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    !is.na(IMPLANT_DATE),
+    IMPLANT_DATE <= MATCH_SUBMIT_DT,
+    is.na(EXPLANT_DATE) |
+      EXPLANT_DATE > MATCH_SUBMIT_DT
+  ) %>%
+  distinct(
+    MATCH_ID_CODE,
+    WL_ID_CODE,
+    MATCH_SUBMIT_DT,
+    PTR_SEQUENCE_NUM
+  ) %>%
+  mutate(
+    on_ecmo = 1L
+  )
+
+cat(
+  "ECMO pediatric rows:",
+  nrow(ecmo_at_match),
+  "\n"
+)
+
+
+# ── Step 6: Combine Status 1A with ventilation/ECMO ───────────────
+# New Status 1 requires:
+#   pediatric Status 1A
+#   AND
+#   ECMO or continuous mechanical ventilation
+
+primary_prefixes <- c(
+  100, 700, 2100, 3300, 4500,
+  2900, 5100, 6900, 8700
+)
+
+ped_flags <- vent_at_match %>%
+  left_join(
+    ecmo_at_match,
+    by = c(
+      "MATCH_ID_CODE",
+      "WL_ID_CODE",
+      "MATCH_SUBMIT_DT",
+      "PTR_SEQUENCE_NUM"
+    )
+  ) %>%
+  mutate(
+    on_ecmo = replace_na(
+      on_ecmo,
+      0L
+    ),
+    new_status1 = as.integer(
+      is_ped_1a_class &
+        (
+          on_vent == 1 |
+            on_ecmo == 1
+        )
+    ),
+    is_primary =
+      class_prefix %in% primary_prefixes
+  )
+
+cat("\nNew Status 1 distribution:\n")
+
+ped_flags %>%
+  count(
+    is_ped_1a_class,
+    on_vent,
+    on_ecmo,
+    new_status1
+  ) %>%
+  print()
+
+if (nrow(ped_flags) != nrow(ped_on_runs)) {
+  stop("Support-status assignment lost pediatric match-run rows.")
+}
+
+
+# ── Step 7: Build Status 1A history ───────────────────────────────
+
+cat("Calculating tier-specific waiting times...\n")
+
+status_hx_1a <- ped_hx_snap %>%
+  filter(
+    WL_ID_CODE %in% all_ped_ids$WL_ID_CODE,
+    UNOS_CAND_STAT_CD == 2010
+  ) %>%
+  mutate(
+    CHG_DATE = as.Date(CHG_DATE),
+    CHG_END_DATE = as.Date(CHG_END_DATE)
+  ) %>%
+  dplyr::select(
+    WL_ID_CODE,
+    CHG_DATE,
+    CHG_END_DATE
+  )
+
+
+# ── Step 7a: Total cumulative active Status 1A time ───────────────
+
+waiting_time_1a <- ped_on_runs %>%
+  left_join(
+    status_hx_1a,
+    by = "WL_ID_CODE",
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    !is.na(CHG_DATE),
+    CHG_DATE <= MATCH_SUBMIT_DT
+  ) %>%
+  mutate(
+    period_end = if_else(
+      is.na(CHG_END_DATE) |
+        CHG_END_DATE > MATCH_SUBMIT_DT,
+      MATCH_SUBMIT_DT,
+      CHG_END_DATE
+    ),
+    days_counted = as.numeric(
+      period_end - CHG_DATE
+    )
+  ) %>%
+  filter(days_counted > 0) %>%
+  group_by(
+    MATCH_ID_CODE,
+    WL_ID_CODE,
+    MATCH_SUBMIT_DT,
+    PTR_SEQUENCE_NUM
+  ) %>%
+  summarise(
+    days_1a = sum(
+      days_counted,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+
+# ── Step 7b: Reconstruct ventilation episodes ─────────────────────
+
+vent_snap_allped <- thoracic_stat1a %>%
+  filter(
+    WL_ID_CODE %in% all_ped_ids$WL_ID_CODE,
+    !is.na(REQ1_CONTINUOUS_VENTILATION)
+  ) %>%
+  mutate(
+    UPGRADE_EXTDATE = as.Date(UPGRADE_EXTDATE)
+  ) %>%
+  dplyr::select(
+    WL_ID_CODE,
+    UPGRADE_EXTDATE,
+    REQ1_CONTINUOUS_VENTILATION
+  ) %>%
+  arrange(
+    WL_ID_CODE,
+    UPGRADE_EXTDATE
+  )
+
+vent_episodes_allped <- vent_snap_allped %>%
+  group_by(WL_ID_CODE) %>%
+  arrange(
+    UPGRADE_EXTDATE,
+    .by_group = TRUE
+  ) %>%
+  mutate(
+    vent_on = as.integer(
+      REQ1_CONTINUOUS_VENTILATION == 1
+    ),
+    prev_vent = lag(
+      vent_on,
+      default = 0L
+    ),
+    episode_start =
+      vent_on == 1 &
+      prev_vent == 0,
+    episode_id =
+      cumsum(episode_start) *
+      vent_on
+  ) %>%
+  filter(vent_on == 1) %>%
+  group_by(
+    WL_ID_CODE,
+    episode_id
+  ) %>%
+  summarise(
+    vent_start = min(
+      UPGRADE_EXTDATE
+    ),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    vent_snap_allped %>%
+      filter(
+        REQ1_CONTINUOUS_VENTILATION != 1
+      ) %>%
+      dplyr::select(
+        WL_ID_CODE,
+        vent_off_date = UPGRADE_EXTDATE
+      ),
+    by = "WL_ID_CODE",
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    is.na(vent_off_date) |
+      vent_off_date > vent_start
+  ) %>%
+  group_by(
+    WL_ID_CODE,
+    episode_id,
+    vent_start
+  ) %>%
+  summarise(
+    vent_end = if (
+      all(is.na(vent_off_date))
+    ) {
+      as.Date(NA)
+    } else {
+      min(
+        vent_off_date,
+        na.rm = TRUE
+      )
+    },
+    .groups = "drop"
+  ) %>%
+  dplyr::select(
+    WL_ID_CODE,
+    vent_start,
+    vent_end
+  )
+
+
+# ── Step 7c: Interval-union helper ────────────────────────────────
+
+union_days_match <- function(starts, ends) {
+  valid <-
+    !is.na(starts) &
+    !is.na(ends) &
+    ends > starts
+  
+  starts <- starts[valid]
+  ends <- ends[valid]
+  
+  if (length(starts) == 0) {
+    return(0)
+  }
+  
+  ord <- order(
+    starts,
+    ends
+  )
+  
+  starts <- starts[ord]
+  ends <- ends[ord]
+  
+  total <- 0
+  current_start <- starts[1]
+  current_end <- ends[1]
+  
+  if (length(starts) > 1) {
+    for (i in 2:length(starts)) {
+      if (starts[i] <= current_end) {
+        current_end <- max(
+          current_end,
+          ends[i]
+        )
+      } else {
+        total <- total +
+          as.numeric(
+            current_end -
+              current_start
+          )
+        
+        current_start <- starts[i]
+        current_end <- ends[i]
+      }
+    }
+  }
+  
+  total <- total +
+    as.numeric(
+      current_end -
+        current_start
+    )
+  
+  total
+}
+
+
+# ── Step 7d: Status 1A intervals through each match-run date ──────
+
+status1a_intervals_match <- ped_on_runs %>%
+  left_join(
+    status_hx_1a,
+    by = "WL_ID_CODE",
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    !is.na(CHG_DATE),
+    CHG_DATE <= MATCH_SUBMIT_DT
+  ) %>%
+  transmute(
+    MATCH_ID_CODE,
+    WL_ID_CODE,
+    MATCH_SUBMIT_DT,
+    PTR_SEQUENCE_NUM,
+    status_start = CHG_DATE,
+    status_end = if_else(
+      is.na(CHG_END_DATE) |
+        CHG_END_DATE > MATCH_SUBMIT_DT,
+      MATCH_SUBMIT_DT,
+      CHG_END_DATE
+    )
+  ) %>%
+  filter(
+    status_end > status_start
+  )
+
+
+# ── Step 7e: ECMO intervals through each match-run date ───────────
+
+ecmo_intervals_match <- ped_on_runs %>%
+  left_join(
+    ecmo_tv,
+    by = "WL_ID_CODE",
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    !is.na(IMPLANT_DATE),
+    IMPLANT_DATE <= MATCH_SUBMIT_DT
+  ) %>%
+  transmute(
+    MATCH_ID_CODE,
+    WL_ID_CODE,
+    MATCH_SUBMIT_DT,
+    PTR_SEQUENCE_NUM,
+    support_start = IMPLANT_DATE,
+    support_end = if_else(
+      is.na(EXPLANT_DATE) |
+        EXPLANT_DATE > MATCH_SUBMIT_DT,
+      MATCH_SUBMIT_DT,
+      EXPLANT_DATE
+    )
+  ) %>%
+  filter(
+    support_end > support_start
+  )
+
+
+# ── Step 7f: Ventilation intervals through each match-run date ────
+
+vent_intervals_match <- ped_on_runs %>%
+  left_join(
+    vent_episodes_allped,
+    by = "WL_ID_CODE",
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    !is.na(vent_start),
+    vent_start <= MATCH_SUBMIT_DT
+  ) %>%
+  transmute(
+    MATCH_ID_CODE,
+    WL_ID_CODE,
+    MATCH_SUBMIT_DT,
+    PTR_SEQUENCE_NUM,
+    support_start = vent_start,
+    support_end = if_else(
+      is.na(vent_end) |
+        vent_end > MATCH_SUBMIT_DT,
+      MATCH_SUBMIT_DT,
+      vent_end
+    )
+  ) %>%
+  filter(
+    support_end > support_start
+  )
+
+
+# ── Step 7g: Combine support intervals ────────────────────────────
+
+support_intervals_match <- bind_rows(
+  ecmo_intervals_match,
+  vent_intervals_match
+)
+
+
+# ── Step 7h: Intersect support with Status 1A ─────────────────────
+
+ns1_intervals_match <- support_intervals_match %>%
+  inner_join(
+    status1a_intervals_match,
+    by = c(
+      "MATCH_ID_CODE",
+      "WL_ID_CODE",
+      "MATCH_SUBMIT_DT",
+      "PTR_SEQUENCE_NUM"
+    ),
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    support_start < status_end,
+    status_start < support_end
+  ) %>%
+  transmute(
+    MATCH_ID_CODE,
+    WL_ID_CODE,
+    MATCH_SUBMIT_DT,
+    PTR_SEQUENCE_NUM,
+    ns1_start = pmax(
+      support_start,
+      status_start
+    ),
+    ns1_end = pmin(
+      support_end,
+      status_end
+    )
+  ) %>%
+  filter(
+    ns1_end > ns1_start
+  )
+
+
+# ── Step 7i: Cumulative nonoverlapping New Status 1 time ──────────
+
+ns1_cumul_match <- ns1_intervals_match %>%
+  group_by(
+    MATCH_ID_CODE,
+    WL_ID_CODE,
+    MATCH_SUBMIT_DT,
+    PTR_SEQUENCE_NUM
+  ) %>%
+  summarise(
+    ns1_days = union_days_match(
+      ns1_start,
+      ns1_end
+    ),
+    .groups = "drop"
+  )
+
+
+# ── Step 7j: Assemble tier-specific waiting times ─────────────────
+
+tier_waiting_time_match <- ped_on_runs %>%
+  dplyr::select(
+    MATCH_ID_CODE,
+    WL_ID_CODE,
+    MATCH_SUBMIT_DT,
+    PTR_SEQUENCE_NUM
+  ) %>%
+  distinct() %>%
+  left_join(
+    waiting_time_1a,
+    by = c(
+      "MATCH_ID_CODE",
+      "WL_ID_CODE",
+      "MATCH_SUBMIT_DT",
+      "PTR_SEQUENCE_NUM"
+    )
+  ) %>%
+  left_join(
+    ns1_cumul_match,
+    by = c(
+      "MATCH_ID_CODE",
+      "WL_ID_CODE",
+      "MATCH_SUBMIT_DT",
+      "PTR_SEQUENCE_NUM"
+    )
+  ) %>%
+  mutate(
+    days_1a = replace_na(
+      days_1a,
+      0
+    ),
+    ns1_days = replace_na(
+      ns1_days,
+      0
+    ),
+    ns2_days = pmax(
+      days_1a - ns1_days,
+      0
+    )
+  )
+
+cat("\nTier-specific waiting-time summary:\n")
+
+tier_waiting_time_match %>%
+  summarise(
+    median_total_1a = median(
+      days_1a,
+      na.rm = TRUE
+    ),
+    median_ns1 = median(
+      ns1_days,
+      na.rm = TRUE
+    ),
+    median_ns2 = median(
+      ns2_days,
+      na.rm = TRUE
+    ),
+    max_total_1a = max(
+      days_1a,
+      na.rm = TRUE
+    ),
+    max_ns1 = max(
+      ns1_days,
+      na.rm = TRUE
+    ),
+    max_ns2 = max(
+      ns2_days,
+      na.rm = TRUE
+    )
+  ) %>%
+  print()
+
+if (
+  any(
+    tier_waiting_time_match$ns1_days >
+    tier_waiting_time_match$days_1a +
+    1e-8,
+    na.rm = TRUE
+  )
+) {
+  stop(
+    paste(
+      "At least one candidate-match-run observation",
+      "has New Status 1 time exceeding total Status 1A time."
+    )
+  )
+}
+
+
+# Keep your existing classification_crosswalk definition here.
+
+
+# ── Step 8: Build counterfactual pediatric classifications ────────
+
+join_keys <- c(
+  "MATCH_ID_CODE",
+  "WL_ID_CODE",
+  "MATCH_SUBMIT_DT",
+  "PTR_SEQUENCE_NUM"
+)
+
+ptr_cf <- ped_flags %>%
+  left_join(
+    tier_waiting_time_match,
+    by = join_keys
+  ) %>%
+  mutate(
+    days_1a = replace_na(
+      days_1a,
+      0
+    ),
+    ns1_days = replace_na(
+      ns1_days,
+      0
+    ),
+    ns2_days = coalesce(
+      ns2_days,
+      pmax(
+        days_1a - ns1_days,
+        0
+      )
+    ),
+    wait_days_tier = if_else(
+      new_status1 == 1,
+      ns1_days,
+      ns2_days
+    ),
+    donor_type = case_when(
+      is_adult_donor ~ "adult",
+      is_ped_donor ~ "ped",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  left_join(
+    classification_crosswalk,
+    by = c(
+      "donor_type",
+      "class_prefix" = "old_class_prefix"
+    )
+  ) %>%
+  mutate(
+    classification_cf = case_when(
+      new_status1 == 1 ~ new_row_if_status1,
+      new_status1 == 0 ~ new_row_if_status0,
+      TRUE ~ NA_real_
+    )
+  )
+
+cat("\nCounterfactual pediatric-row checks:\n")
+
+cat(
+  "Pediatric rows:",
+  nrow(ptr_cf),
+  "\n"
+)
+
+cat(
+  "Rows with missing donor type:",
+  sum(is.na(ptr_cf$donor_type)),
+  "\n"
+)
+
+cat(
+  "Rows without a counterfactual classification:",
+  sum(is.na(ptr_cf$classification_cf)),
+  "\n"
+)
+
+cat(
+  "Rows where crosswalk 1A flag disagrees with match-run flag:",
+  sum(
+    !is.na(ptr_cf$is_1a) &
+      ptr_cf$is_1a != ptr_cf$is_ped_1a_class,
+    na.rm = TRUE
+  ),
+  "\n"
+)
+
+cat(
+  "Pediatric rows expected from ped_on_runs:",
+  nrow(ped_on_runs),
+  "\n"
+)
+
+if (nrow(ptr_cf) != nrow(ped_on_runs)) {
+  stop("Counterfactual pediatric classification lost match-run rows.")
+}
+
+cat("\nTier-specific waiting-time summary:\n")
+
+ptr_cf %>%
+  group_by(new_status1) %>%
+  summarise(
+    n = n(),
+    median_wt = median(
+      wait_days_tier,
+      na.rm = TRUE
+    ),
+    mean_wt = round(
+      mean(
+        wait_days_tier,
+        na.rm = TRUE
+      ),
+      1
+    ),
+    .groups = "drop"
+  ) %>%
+  print()
+
+
+# ── Step 9: Build complete counterfactual match runs ──────────────
+
+all_on_runs_unfiltered <- ptr_ped_runs %>%
+  as_tibble() %>%
+  dplyr::select(
+    MATCH_ID_CODE,
+    WL_ID_CODE,
+    PTR_SEQUENCE_NUM,
+    class_prefix,
+    is_ped_candidate,
+    is_ped_1a_class,
+    is_adult_donor,
+    is_ped_donor,
+    MATCH_SUBMIT_DT,
+    OFFER_ACCEPT,
+    PTR_CLOSE_NUM
+  ) %>%
+  left_join(
+    ptr_cf %>%
+      dplyr::select(
+        MATCH_ID_CODE,
+        WL_ID_CODE,
+        PTR_SEQUENCE_NUM,
+        classification_cf,
+        wait_days_tier,
+        new_status1,
+        on_vent,
+        on_ecmo
+      ),
+    by = c(
+      "MATCH_ID_CODE",
+      "WL_ID_CODE",
+      "PTR_SEQUENCE_NUM"
+    )
+  ) %>%
+  mutate(
+    donor_type_lookup = case_when(
+      is_adult_donor ~ "adult",
+      is_ped_donor ~ "ped",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  left_join(
+    classification_crosswalk %>%
+      dplyr::select(
+        donor_type,
+        old_class_prefix,
+        new_row_if_status0
+      ),
+    by = c(
+      "donor_type_lookup" = "donor_type",
+      "class_prefix" = "old_class_prefix"
+    )
+  ) %>%
+  mutate(
+    classification_cf = case_when(
+      !is.na(classification_cf) ~ classification_cf,
+      !is.na(new_row_if_status0) ~ new_row_if_status0,
+      TRUE ~ NA_real_
+    ),
+    wait_days_tier = replace_na(
+      wait_days_tier,
+      0
+    ),
+    sort_key2 = case_when(
+      is_ped_candidate &
+        is_ped_1a_class ~ -wait_days_tier,
+      TRUE ~ as.numeric(PTR_SEQUENCE_NUM)
+    ),
+    sort_key3 = as.numeric(
+      PTR_SEQUENCE_NUM
+    )
+  )
+
+
+# ── Diagnose reconstruction failures before filtering ─────────────
+
+failed_cf_rows <- all_on_runs_unfiltered %>%
+  filter(
+    is.na(classification_cf)
+  ) %>%
+  mutate(
+    failure_reason = case_when(
+      is.na(donor_type_lookup) ~
+        "Missing donor age/type",
+      is.na(class_prefix) ~
+        "Missing or unparseable classification prefix",
+      is.na(new_row_if_status0) ~
+        "Classification prefix absent from crosswalk",
+      TRUE ~ "Other"
+    )
+  )
+
+cat("\n=== COUNTERFACTUAL RECONSTRUCTION FAILURES ===\n")
+
+failed_cf_rows %>%
+  count(
+    failure_reason,
+    sort = TRUE
+  ) %>%
+  print(n = Inf)
+
+cat(
+  "Rows with failed reconstruction:",
+  nrow(failed_cf_rows),
+  "\n"
+)
+
+cat(
+  "Affected match runs:",
+  n_distinct(failed_cf_rows$MATCH_ID_CODE),
+  "\n"
+)
+
+cat("\nFailed prefixes with known donor type:\n")
+
+failed_cf_rows %>%
+  filter(
+    !is.na(donor_type_lookup)
+  ) %>%
+  count(
+    donor_type_lookup,
+    class_prefix,
+    sort = TRUE
+  ) %>%
+  print(n = Inf)
+
+
+# Remove only genuinely unclassifiable rows after displaying the reason.
+
+all_on_runs <- all_on_runs_unfiltered %>%
+  filter(
+    !is.na(classification_cf)
+  )
+
+cat(
+  "\nRows before reconstruction filter:",
+  nrow(all_on_runs_unfiltered),
+  "\n"
+)
+
+cat(
+  "Rows after reconstruction filter:",
+  nrow(all_on_runs),
+  "\n"
+)
+
+cat(
+  "Original match runs:",
+  n_distinct(ptr_ped_runs$MATCH_ID_CODE),
+  "\n"
+)
+
+cat(
+  "Match runs remaining after filter:",
+  n_distinct(all_on_runs$MATCH_ID_CODE),
+  "\n"
+)
+
+
+# ── Resequence counterfactual match runs ──────────────────────────
+
+ptr_resequenced <- all_on_runs %>%
+  group_by(MATCH_ID_CODE) %>%
+  arrange(
+    classification_cf,
+    sort_key2,
+    sort_key3,
+    .by_group = TRUE
+  ) %>%
+  mutate(
+    new_sequence_cf = row_number(),
+    sequence_change_cf =
+      new_sequence_cf -
+      PTR_SEQUENCE_NUM,
+    positions_moved_cf =
+      abs(sequence_change_cf),
+    moved_up_cf =
+      sequence_change_cf < 0,
+    moved_down_cf =
+      sequence_change_cf > 0
+  ) %>%
+  ungroup()
+
+cat("\n=== 4-STATUS COUNTERFACTUAL COMPLETE ===\n")
+
+cat(
+  "Total rows:",
+  nrow(ptr_resequenced),
+  "\n"
+)
+
+cat(
+  "Match runs:",
+  n_distinct(ptr_resequenced$MATCH_ID_CODE),
+  "\n"
+)
+
+cat(
+  "Original match runs:",
+  n_distinct(ptr_ped_runs$MATCH_ID_CODE),
+  "\n"
+)
+
+
+# ── Step 10: Rank-change results ──────────────────────────────────
+
+cat("\nRank change for pediatric Status 1A candidates:\n")
+
+ptr_resequenced %>%
+  filter(
+    is_ped_candidate,
+    is_ped_1a_class,
+    !is.na(new_status1)
+  ) %>%
+  group_by(new_status1) %>%
+  summarise(
+    n = n(),
+    median_current_rank = median(
+      PTR_SEQUENCE_NUM,
+      na.rm = TRUE
+    ),
+    median_new_rank = median(
+      new_sequence_cf,
+      na.rm = TRUE
+    ),
+    median_change = median(
+      sequence_change_cf,
+      na.rm = TRUE
+    ),
+    pct_moved_up = round(
+      mean(
+        moved_up_cf,
+        na.rm = TRUE
+      ) * 100,
+      1
+    ),
+    pct_stayed_same = round(
+      mean(
+        sequence_change_cf == 0,
+        na.rm = TRUE
+      ) * 100,
+      1
+    ),
+    pct_moved_down = round(
+      mean(
+        moved_down_cf,
+        na.rm = TRUE
+      ) * 100,
+      1
+    ),
+    .groups = "drop"
+  ) %>%
+  print()
+
+
+# ── Step 11: Displacement analysis ────────────────────────────────
+
+displacement <- ptr_resequenced %>%
+  filter(
+    is_ped_candidate,
+    is_ped_1a_class,
+    !is.na(new_status1)
+  ) %>%
+  group_by(MATCH_ID_CODE) %>%
+  summarise(
+    has_status1 = any(
+      new_status1 == 1,
+      na.rm = TRUE
+    ),
+    has_status2 = any(
+      new_status1 == 0,
+      na.rm = TRUE
+    ),
+    min_rank_status1 = if (
+      any(
+        new_status1 == 1,
+        na.rm = TRUE
+      )
+    ) {
+      min(
+        PTR_SEQUENCE_NUM[
+          new_status1 == 1
+        ],
+        na.rm = TRUE
+      )
+    } else {
+      NA_real_
+    },
+    min_rank_status2 = if (
+      any(
+        new_status1 == 0,
+        na.rm = TRUE
+      )
+    ) {
+      min(
+        PTR_SEQUENCE_NUM[
+          new_status1 == 0
+        ],
+        na.rm = TRUE
+      )
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  ) %>%
+  filter(
+    has_status1,
+    has_status2
+  ) %>%
+  mutate(
+    status2_ranked_above =
+      min_rank_status2 <
+      min_rank_status1
+  )
+
+cat("\nDisplacement analysis:\n")
+
+cat(
+  "Match runs with both New Status 1 and New Status 2:",
+  nrow(displacement),
+  "\n"
+)
+
+cat(
+  "Match runs where New Status 2 was originally above New Status 1:",
+  sum(
+    displacement$status2_ranked_above,
+    na.rm = TRUE
+  ),
+  sprintf(
+    "(%.1f%%)\n",
+    mean(
+      displacement$status2_ranked_above,
+      na.rm = TRUE
+    ) * 100
+  )
+)
+
+
+# ── Step 12: Pediatric acceptance summary ─────────────────────────
+
+ptr_all_ped <- ptr_resequenced %>%
+  filter(
+    is_ped_candidate
+  )
+
+acceptance_summary <- ptr_all_ped %>%
+  summarise(
+    n_match_runs =
+      n_distinct(MATCH_ID_CODE),
+    n_pediatric_acceptances =
+      n_distinct(
+        MATCH_ID_CODE[
+          OFFER_ACCEPT == "Y"
+        ]
+      ),
+    acceptance_pct =
+      100 *
+      n_pediatric_acceptances /
+      n_match_runs,
+    median_acceptance_sequence =
+      median(
+        PTR_SEQUENCE_NUM[
+          OFFER_ACCEPT == "Y"
+        ],
+        na.rm = TRUE
+      ),
+    q25_acceptance_sequence =
+      quantile(
+        PTR_SEQUENCE_NUM[
+          OFFER_ACCEPT == "Y"
+        ],
+        0.25,
+        na.rm = TRUE
+      ),
+    q75_acceptance_sequence =
+      quantile(
+        PTR_SEQUENCE_NUM[
+          OFFER_ACCEPT == "Y"
+        ],
+        0.75,
+        na.rm = TRUE
+      )
+  )
+
+acceptance_summary
+
+```
+
+``` {r build counterfactual}
+
+# ── Configuration ─────────────────────────────────────────────────
+CONFIG_PED <- list(
+  L_POINT       = 20L,   # Random deduplication draws for point estimates
+  N_BOOT        = 1000L, # Candidate-clustered bootstrap iterations
+  P_MAX         = 20L,
+  TREND_P_MAX   = 20L,
+  N_MIN         = 10L,
+  T_HORIZON     = 90,
+  ADMIN_TIME    = 90.01,
+  SEED          = 20240414L,
+  CONF_LEVEL    = 0.95
+)
+
+join_keys <- c(
+  "MATCH_ID_CODE",
+  "WL_ID_CODE",
+  "MATCH_SUBMIT_DT",
+  "PTR_SEQUENCE_NUM"
+)
+
+
+# ── Classification crosswalk ──────────────────────────────────────
+# Current allocation classification code mapped to its corresponding
+# row in the counterfactual allocation sequence.
+#
+# new_row_if_status1 applies to Status 1A candidates on ECMO or
+# continuous mechanical ventilation.
+#
+# new_row_if_status0 applies to all remaining candidates.
+
+classification_crosswalk <- tribble(
+  ~donor_type, ~old_class_prefix, ~is_1a, ~new_row_if_status1, ~new_row_if_status0,
+  "adult", 100, TRUE, 1, 3,
+  "adult", 200, TRUE, 2, 4,
+  "adult", 300, FALSE, 5, 5,
+  "adult", 400, FALSE, 6, 6,
+  "adult", 500, FALSE, 7, 7,
+  "adult", 600, FALSE, 8, 8,
+  "adult", 700, TRUE, 9, 11,
+  "adult", 800, TRUE, 10, 12,
+  "adult", 900, FALSE, 13, 13,
+  "adult", 1000, FALSE, 14, 14,
+  "adult", 1100, FALSE, 15, 15,
+  "adult", 1200, FALSE, 16, 16,
+  "adult", 1300, FALSE, 17, 17,
+  "adult", 1400, FALSE, 18, 18,
+  "adult", 1500, FALSE, 19, 19,
+  "adult", 1600, FALSE, 20, 20,
+  "adult", 1700, FALSE, 21, 21,
+  "adult", 1800, FALSE, 22, 22,
+  "adult", 1900, FALSE, 23, 23,
+  "adult", 2000, FALSE, 24, 24,
+  "adult", 2100, TRUE, 25, 27,
+  "adult", 2200, TRUE, 26, 28,
+  "adult", 2300, FALSE, 29, 29,
+  "adult", 2400, FALSE, 30, 30,
+  "adult", 2500, FALSE, 31, 31,
+  "adult", 2600, FALSE, 32, 32,
+  "adult", 2700, FALSE, 33, 33,
+  "adult", 2800, FALSE, 34, 34,
+  "adult", 2900, FALSE, 35, 35,
+  "adult", 3000, FALSE, 36, 36,
+  "adult", 3100, FALSE, 37, 37,
+  "adult", 3200, FALSE, 38, 38,
+  "adult", 3300, TRUE, 39, 41,
+  "adult", 3400, TRUE, 40, 42,
+  "adult", 3500, FALSE, 43, 43,
+  "adult", 3600, FALSE, 44, 44,
+  "adult", 3700, FALSE, 45, 45,
+  "adult", 3800, FALSE, 46, 46,
+  "adult", 3900, FALSE, 47, 47,
+  "adult", 4000, FALSE, 48, 48,
+  "adult", 4100, FALSE, 49, 49,
+  "adult", 4200, FALSE, 50, 50,
+  "adult", 4300, FALSE, 51, 51,
+  "adult", 4400, FALSE, 52, 52,
+  "adult", 4500, TRUE, 53, 55,
+  "adult", 4600, TRUE, 54, 56,
+  "adult", 4700, FALSE, 57, 57,
+  "adult", 4800, FALSE, 58, 58,
+  "adult", 4900, FALSE, 59, 59,
+  "adult", 5000, FALSE, 60, 60,
+  "adult", 5100, FALSE, 61, 61,
+  "adult", 5200, FALSE, 62, 62,
+  "adult", 5300, FALSE, 63, 63,
+  "adult", 5400, FALSE, 64, 64,
+  "adult", 5500, FALSE, 65, 65,
+  "adult", 5600, FALSE, 66, 66,
+  "adult", 5700, FALSE, 67, 67,
+  "adult", 5800, FALSE, 68, 68,
+  "adult", 5900, FALSE, 69, 69,
+  "adult", 6000, FALSE, 70, 70,
+  "adult", 6100, FALSE, 71, 71,
+  "adult", 6200, FALSE, 72, 72,
+  "adult", 6300, FALSE, 73, 73,
+  "adult", 6400, FALSE, 74, 74,
+  "adult", 6500, FALSE, 75, 75,
+  "adult", 6600, FALSE, 76, 76,
+  "adult", 6700, FALSE, 77, 77,
+  "adult", 6800, FALSE, 78, 78,
+  
+  "ped", 100, TRUE, 1, 3,
+  "ped", 200, TRUE, 2, 4,
+  "ped", 300, FALSE, 5, 5,
+  "ped", 400, FALSE, 6, 6,
+  "ped", 500, FALSE, 7, 7,
+  "ped", 600, FALSE, 8, 8,
+  "ped", 700, FALSE, 9, 9,
+  "ped", 800, FALSE, 10, 10,
+  "ped", 900, FALSE, 11, 11,
+  "ped", 1000, FALSE, 12, 12,
+  "ped", 1100, FALSE, 13, 13,
+  "ped", 1200, FALSE, 14, 14,
+  "ped", 1300, FALSE, 15, 15,
+  "ped", 1400, FALSE, 16, 16,
+  "ped", 1500, FALSE, 17, 17,
+  "ped", 1600, FALSE, 18, 18,
+  "ped", 1700, FALSE, 19, 19,
+  "ped", 1800, FALSE, 20, 20,
+  "ped", 1900, FALSE, 21, 21,
+  "ped", 2000, FALSE, 22, 22,
+  "ped", 2100, FALSE, 23, 23,
+  "ped", 2200, FALSE, 24, 24,
+  "ped", 2300, FALSE, 25, 25,
+  "ped", 2400, FALSE, 26, 26,
+  "ped", 2500, FALSE, 27, 27,
+  "ped", 2600, FALSE, 28, 28,
+  "ped", 2700, FALSE, 29, 29,
+  "ped", 2800, FALSE, 30, 30,
+  "ped", 2900, TRUE, 31, 33,
+  "ped", 3000, TRUE, 32, 34,
+  "ped", 3100, FALSE, 35, 35,
+  "ped", 3200, FALSE, 36, 36,
+  "ped", 3300, FALSE, 37, 37,
+  "ped", 3400, FALSE, 38, 38,
+  "ped", 3500, FALSE, 39, 39,
+  "ped", 3600, FALSE, 40, 40,
+  "ped", 3700, FALSE, 41, 41,
+  "ped", 3800, FALSE, 42, 42,
+  "ped", 3900, FALSE, 43, 43,
+  "ped", 4000, FALSE, 44, 44,
+  "ped", 4100, FALSE, 45, 45,
+  "ped", 4200, FALSE, 46, 46,
+  "ped", 4300, FALSE, 47, 47,
+  "ped", 4400, FALSE, 48, 48,
+  "ped", 4500, FALSE, 49, 49,
+  "ped", 4600, FALSE, 50, 50,
+  "ped", 4700, FALSE, 51, 51,
+  "ped", 4800, FALSE, 52, 52,
+  "ped", 4900, FALSE, 53, 53,
+  "ped", 5000, FALSE, 54, 54,
+  "ped", 5100, TRUE, 55, 57,
+  "ped", 5200, TRUE, 56, 58,
+  "ped", 5300, FALSE, 59, 59,
+  "ped", 5400, FALSE, 60, 60,
+  "ped", 5500, FALSE, 61, 61,
+  "ped", 5600, FALSE, 62, 62,
+  "ped", 5700, FALSE, 63, 63,
+  "ped", 5800, FALSE, 64, 64,
+  "ped", 5900, FALSE, 65, 65,
+  "ped", 6000, FALSE, 66, 66,
+  "ped", 6100, FALSE, 67, 67,
+  "ped", 6200, FALSE, 68, 68,
+  "ped", 6300, FALSE, 69, 69,
+  "ped", 6400, FALSE, 70, 70,
+  "ped", 6500, FALSE, 71, 71,
+  "ped", 6600, FALSE, 72, 72,
+  "ped", 6700, FALSE, 73, 73,
+  "ped", 6800, FALSE, 74, 74,
+  "ped", 6900, TRUE, 75, 77,
+  "ped", 7000, TRUE, 76, 78,
+  "ped", 7100, FALSE, 79, 79,
+  "ped", 7200, FALSE, 80, 80,
+  "ped", 7300, FALSE, 81, 81,
+  "ped", 7400, FALSE, 82, 82,
+  "ped", 7500, FALSE, 83, 83,
+  "ped", 7600, FALSE, 84, 84,
+  "ped", 7700, FALSE, 85, 85,
+  "ped", 7800, FALSE, 86, 86,
+  "ped", 7900, FALSE, 87, 87,
+  "ped", 8000, FALSE, 88, 88,
+  "ped", 8100, FALSE, 89, 89,
+  "ped", 8200, FALSE, 90, 90,
+  "ped", 8300, FALSE, 91, 91,
+  "ped", 8400, FALSE, 92, 92,
+  "ped", 8500, FALSE, 93, 93,
+  "ped", 8600, FALSE, 94, 94,
+  "ped", 8700, TRUE, 95, 97,
+  "ped", 8800, TRUE, 96, 98,
+  "ped", 8900, FALSE, 99, 99,
+  "ped", 9000, FALSE, 100, 100,
+  "ped", 9100, FALSE, 101, 101,
+  "ped", 9200, FALSE, 102, 102,
+  "ped", 9300, FALSE, 103, 103,
+  "ped", 9400, FALSE, 104, 104,
+  "ped", 9500, FALSE, 105, 105,
+  "ped", 9600, FALSE, 106, 106,
+  "ped", 9700, FALSE, 107, 107,
+  "ped", 9800, FALSE, 108, 108,
+  "ped", 9900, FALSE, 109, 109,
+  "ped", 10000, FALSE, 110, 110,
+  "ped", 10100, FALSE, 111, 111,
+  "ped", 10200, FALSE, 112, 112,
+  "ped", 10300, FALSE, 113, 113,
+  "ped", 10400, FALSE, 114, 114
+)
+
+
+# ── Step 8: Build pediatric counterfactual classifications ────────
+# tier_waiting_time_match was built in the preceding chunk and
+# contains the corrected:
+#
+#   days_1a
+#   ns1_days = Status 1A ∩ (ECMO ∪ ventilation)
+#   ns2_days = days_1a - ns1_days
+
+ptr_cf <- ped_flags %>%
+  left_join(
+    tier_waiting_time_match,
+    by = join_keys
+  ) %>%
+  mutate(
+    days_1a  = replace_na(days_1a, 0),
+    ns1_days = replace_na(ns1_days, 0),
+    
+    ns2_days = coalesce(
+      ns2_days,
+      pmax(days_1a - ns1_days, 0)
+    ),
+    
+    wait_days_tier = if_else(
+      new_status1 == 1,
+      ns1_days,
+      ns2_days
+    ),
+    
+    donor_type = case_when(
+      is_adult_donor ~ "adult",
+      is_ped_donor   ~ "ped",
+      TRUE           ~ NA_character_
+    )
+  ) %>%
+  left_join(
+    classification_crosswalk,
+    by = c(
+      "donor_type",
+      "class_prefix" = "old_class_prefix"
+    )
+  ) %>%
+  mutate(
+    classification_cf = case_when(
+      new_status1 == 1 ~ new_row_if_status1,
+      new_status1 == 0 ~ new_row_if_status0,
+      TRUE             ~ NA_real_
+    )
+  )
+
+cat("\nCounterfactual crosswalk checks:\n")
+
+cat(
+  "Rows with missing donor type:",
+  sum(is.na(ptr_cf$donor_type)),
+  "\n"
+)
+
+cat(
+  "Rows without a counterfactual classification:",
+  sum(is.na(ptr_cf$classification_cf)),
+  "\n"
+)
+
+cat(
+  "Rows where crosswalk 1A flag disagrees with match-run flag:",
+  sum(
+    !is.na(ptr_cf$is_1a) &
+      ptr_cf$is_1a != ptr_cf$is_ped_1a_class,
+    na.rm = TRUE
+  ),
+  "\n"
+)
+
+
+# Exclude observations that cannot be placed in the crosswalk.
+ptr_cf <- ptr_cf %>%
+  filter(
+    !is.na(classification_cf)
+  )
+
+
+cat("\nTier-specific waiting-time summary:\n")
+
+ptr_cf %>%
+  group_by(new_status1) %>%
+  summarise(
+    n = n(),
+    median_wt = median(
+      wait_days_tier,
+      na.rm = TRUE
+    ),
+    mean_wt = round(
+      mean(
+        wait_days_tier,
+        na.rm = TRUE
+      ),
+      1
+    ),
+    .groups = "drop"
+  ) %>%
+  print()
+
+
+if (
+  any(
+    ptr_cf$ns1_days >
+    ptr_cf$days_1a + 1e-8,
+    na.rm = TRUE
+  )
+) {
+  stop(
+    "At least one observation has New Status 1 time exceeding total Status 1A time."
+  )
+}
+
+
+# ── Step 9: Resequence every candidate on each match run ──────────
+# Pediatric candidates receive their candidate-specific
+# counterfactual classification from ptr_cf.
+#
+# All other candidates retain the corresponding non-New-Status-1
+# crosswalk row.
+
+all_on_runs <- ptr_ped_runs %>%
+  as_tibble() %>%
+  dplyr::select(
+    MATCH_ID_CODE,
+    WL_ID_CODE,
+    PTR_SEQUENCE_NUM,
+    class_prefix,
+    is_ped_candidate,
+    is_ped_1a_class,
+    is_adult_donor,
+    is_ped_donor,
+    MATCH_SUBMIT_DT,
+    OFFER_ACCEPT,
+    PTR_CLOSE_NUM
+  ) %>%
+  left_join(
+    ptr_cf %>%
+      dplyr::select(
+        MATCH_ID_CODE,
+        WL_ID_CODE,
+        PTR_SEQUENCE_NUM,
+        classification_cf,
+        wait_days_tier,
+        new_status1,
+        on_vent,
+        on_ecmo
+      ),
+    by = c(
+      "MATCH_ID_CODE",
+      "WL_ID_CODE",
+      "PTR_SEQUENCE_NUM"
+    )
+  ) %>%
+  mutate(
+    donor_type_lookup = case_when(
+      is_adult_donor ~ "adult",
+      is_ped_donor   ~ "ped",
+      TRUE           ~ NA_character_
+    )
+  ) %>%
+  left_join(
+    classification_crosswalk %>%
+      dplyr::select(
+        donor_type,
+        old_class_prefix,
+        new_row_if_status0
+      ),
+    by = c(
+      "donor_type_lookup" = "donor_type",
+      "class_prefix" = "old_class_prefix"
+    )
+  ) %>%
+  mutate(
+    # Pediatric rows already classified in ptr_cf retain that
+    # classification. All other rows use the standard/non-Status-1
+    # crosswalk position.
+    classification_cf = case_when(
+      !is.na(classification_cf) ~ classification_cf,
+      !is.na(new_row_if_status0) ~ new_row_if_status0,
+      TRUE ~ NA_real_
+    ),
+    
+    wait_days_tier = replace_na(
+      wait_days_tier,
+      0
+    ),
+    
+    # For pediatric Status 1A rows, tier-specific waiting time orders
+    # candidates within the new tier. For all other rows, preserve
+    # current match-run order within their classification.
+    sort_key2 = case_when(
+      is_ped_candidate &
+        is_ped_1a_class ~ -wait_days_tier,
+      
+      TRUE ~ as.numeric(PTR_SEQUENCE_NUM)
+    ),
+    
+    # Deterministic tie-breaker.
+    sort_key3 = as.numeric(PTR_SEQUENCE_NUM)
+  )
+
+
+cat(
+  "\nRows excluded because no crosswalk classification was available:",
+  sum(is.na(all_on_runs$classification_cf)),
+  "\n"
+)
+
+
+all_on_runs <- all_on_runs %>%
+  filter(
+    !is.na(classification_cf)
+  )
+
+
+# Pediatric Status 1A rows should have a resolved new_status1 flag.
+missing_ped_1a_flag <- all_on_runs %>%
+  filter(
+    is_ped_candidate,
+    is_ped_1a_class,
+    is.na(new_status1)
+  )
+
+cat(
+  "Pediatric Status 1A rows without a resolved New Status flag:",
+  nrow(missing_ped_1a_flag),
+  "\n"
+)
+
+
+# Preserve the prior exclusion rule while making it explicit.
+all_on_runs <- all_on_runs %>%
+  filter(
+    !(
+      is_ped_candidate &
+        is_ped_1a_class &
+        is.na(new_status1)
+    )
+  )
+
+
+ptr_resequenced <- all_on_runs %>%
+  group_by(MATCH_ID_CODE) %>%
+  arrange(
+    classification_cf,
+    sort_key2,
+    sort_key3,
+    .by_group = TRUE
+  ) %>%
+  mutate(
+    new_sequence_cf = row_number(),
+    
+    sequence_change_cf =
+      new_sequence_cf -
+      PTR_SEQUENCE_NUM,
+    
+    positions_moved_cf =
+      abs(sequence_change_cf),
+    
+    moved_up_cf =
+      sequence_change_cf < 0,
+    
+    moved_down_cf =
+      sequence_change_cf > 0
+  ) %>%
+  ungroup()
+
+
+cat("\n=== 4-STATUS COUNTERFACTUAL COMPLETE ===\n")
+
+cat(
+  "Total rows:",
+  nrow(ptr_resequenced),
+  "\n"
+)
+
+cat(
+  "Match runs:",
+  n_distinct(ptr_resequenced$MATCH_ID_CODE),
+  "\n"
+)
+
+
+# ── Step 10: Rank-change results ───────────────────────────────────
+cat("\nRank change for pediatric Status 1A candidates:\n")
+
+ptr_resequenced %>%
+  filter(
+    is_ped_candidate,
+    is_ped_1a_class,
+    !is.na(new_status1)
+  ) %>%
+  group_by(new_status1) %>%
+  summarise(
+    n = n(),
+    
+    median_current_rank = median(
+      PTR_SEQUENCE_NUM,
+      na.rm = TRUE
+    ),
+    
+    median_new_rank = median(
+      new_sequence_cf,
+      na.rm = TRUE
+    ),
+    
+    median_change = median(
+      sequence_change_cf,
+      na.rm = TRUE
+    ),
+    
+    pct_moved_up = round(
+      mean(
+        moved_up_cf,
+        na.rm = TRUE
+      ) * 100,
+      1
+    ),
+    
+    pct_stayed_same = round(
+      mean(
+        sequence_change_cf == 0,
+        na.rm = TRUE
+      ) * 100,
+      1
+    ),
+    
+    pct_moved_down = round(
+      mean(
+        moved_down_cf,
+        na.rm = TRUE
+      ) * 100,
+      1
+    ),
+    
+    .groups = "drop"
+  ) %>%
+  print()
+
+
+# ── Step 11: Displacement analysis ────────────────────────────────
+displacement <- ptr_resequenced %>%
+  filter(
+    is_ped_candidate,
+    is_ped_1a_class,
+    !is.na(new_status1)
+  ) %>%
+  group_by(MATCH_ID_CODE) %>%
+  summarise(
+    has_status1 = any(
+      new_status1 == 1,
+      na.rm = TRUE
+    ),
+    
+    has_status2 = any(
+      new_status1 == 0,
+      na.rm = TRUE
+    ),
+    
+    min_rank_status1 = if (
+      any(new_status1 == 1, na.rm = TRUE)
+    ) {
+      min(
+        PTR_SEQUENCE_NUM[new_status1 == 1],
+        na.rm = TRUE
+      )
+    } else {
+      NA_real_
+    },
+    
+    min_rank_status2 = if (
+      any(new_status1 == 0, na.rm = TRUE)
+    ) {
+      min(
+        PTR_SEQUENCE_NUM[new_status1 == 0],
+        na.rm = TRUE
+      )
+    } else {
+      NA_real_
+    },
+    
+    .groups = "drop"
+  ) %>%
+  filter(
+    has_status1,
+    has_status2
+  ) %>%
+  mutate(
+    status2_ranked_above =
+      min_rank_status2 <
+      min_rank_status1
+  )
+
+
+cat("\nDisplacement analysis:\n")
+
+cat(
+  "Match runs with both New Status 1 and New Status 2:",
+  nrow(displacement),
+  "\n"
+)
+
+cat(
+  "Match runs where New Status 2 was originally above New Status 1:",
+  sum(
+    displacement$status2_ranked_above,
+    na.rm = TRUE
+  ),
+  sprintf(
+    "(%.1f%%)\n",
+    mean(
+      displacement$status2_ranked_above,
+      na.rm = TRUE
+    ) * 100
+  )
+)
+
+
+cat("\nRank change — New Status 1 candidates:\n")
+
+ptr_resequenced %>%
+  filter(
+    is_ped_candidate,
+    is_ped_1a_class,
+    new_status1 == 1
+  ) %>%
+  summarise(
+    n = n(),
+    
+    median_current = median(
+      PTR_SEQUENCE_NUM,
+      na.rm = TRUE
+    ),
+    
+    median_new = median(
+      new_sequence_cf,
+      na.rm = TRUE
+    ),
+    
+    median_change = median(
+      sequence_change_cf,
+      na.rm = TRUE
+    ),
+    
+    pct_up = round(
+      mean(
+        moved_up_cf,
+        na.rm = TRUE
+      ) * 100,
+      1
+    ),
+    
+    pct_same = round(
+      mean(
+        sequence_change_cf == 0,
+        na.rm = TRUE
+      ) * 100,
+      1
+    ),
+    
+    pct_down = round(
+      mean(
+        moved_down_cf,
+        na.rm = TRUE
+      ) * 100,
+      1
+    )
+  ) %>%
+  print()
+
+
+cat("\nRank change — New Status 2 candidates:\n")
+
+ptr_resequenced %>%
+  filter(
+    is_ped_candidate,
+    is_ped_1a_class,
+    new_status1 == 0
+  ) %>%
+  summarise(
+    n = n(),
+    
+    median_current = median(
+      PTR_SEQUENCE_NUM,
+      na.rm = TRUE
+    ),
+    
+    median_new = median(
+      new_sequence_cf,
+      na.rm = TRUE
+    ),
+    
+    median_change = median(
+      sequence_change_cf,
+      na.rm = TRUE
+    ),
+    
+    pct_up = round(
+      mean(
+        moved_up_cf,
+        na.rm = TRUE
+      ) * 100,
+      1
+    ),
+    
+    pct_same = round(
+      mean(
+        sequence_change_cf == 0,
+        na.rm = TRUE
+      ) * 100,
+      1
+    ),
+    
+    pct_down = round(
+      mean(
+        moved_down_cf,
+        na.rm = TRUE
+      ) * 100,
+      1
+    )
+  ) %>%
+  print()
+
+
+# ── Step 12: Build outcome data ───────────────────────────────────
+outcomes_all_ped <- thoracic_data %>%
+  filter(
+    WL_ORG == "HR",
+    INIT_AGE < 18,
+    as.Date(INIT_DATE) <=
+      as.Date("2024-12-31")
+  ) %>%
+  mutate(
+    END_DATE = as.Date(END_DATE),
+    
+    death = as.integer(
+      REM_CD %in% c(8, 13)
+    )
+  ) %>%
+  dplyr::select(
+    WL_ID_CODE,
+    END_DATE,
+    death
+  )
+
+
+ptr_all_ped <- ptr_resequenced %>%
+  filter(is_ped_candidate)
+
+
+sys_current <- ptr_all_ped %>%
+  dplyr::select(
+    MATCH_ID_CODE,
+    WL_ID_CODE,
+    sequence = PTR_SEQUENCE_NUM,
+    MATCH_SUBMIT_DT,
+    OFFER_ACCEPT
+  ) %>%
+  mutate(
+    System = "Current System"
+  )
+
+
+sys_cf <- ptr_all_ped %>%
+  dplyr::select(
+    MATCH_ID_CODE,
+    WL_ID_CODE,
+    sequence = new_sequence_cf,
+    MATCH_SUBMIT_DT,
+    OFFER_ACCEPT
+  ) %>%
+  mutate(
+    System = "4-Status Counterfactual"
+  )
+
+
+outcome_long_all <- bind_rows(
+  sys_current,
+  sys_cf
+) %>%
+  left_join(
+    outcomes_all_ped,
+    by = "WL_ID_CODE"
+  ) %>%
+  mutate(
+    MATCH_SUBMIT_DT =
+      as.Date(MATCH_SUBMIT_DT),
+    
+    END_DATE =
+      as.Date(END_DATE),
+    
+    death =
+      replace_na(death, 0L),
+    
+    time_to_removal =
+      as.numeric(
+        END_DATE -
+          MATCH_SUBMIT_DT
+      ),
+    
+    # Same-day outcomes/removals receive a small positive time because
+    # exact timestamps are unavailable.
+    observed_time = case_when(
+      is.na(time_to_removal) ~ NA_real_,
+      time_to_removal < 0   ~ NA_real_,
+      time_to_removal == 0  ~ 0.5,
+      TRUE                  ~ time_to_removal
+    ),
+    
+    # Death or removal for deterioration through and including day 90.
+    event = as.integer(
+      death == 1 &
+        !is.na(observed_time) &
+        observed_time <=
+        CONFIG_PED$T_HORIZON
+    ),
+    
+    # Event before or at day 90:
+    # retain event time.
+    #
+    # Transplant/other removal before or at day 90:
+    # censor at actual removal time.
+    #
+    # Event-free through day 90:
+    # assign administrative follow-up just beyond day 90.
+    time_days = case_when(
+      event == 1 ~ observed_time,
+      
+      !is.na(observed_time) &
+        observed_time <=
+        CONFIG_PED$T_HORIZON ~ observed_time,
+      
+      TRUE ~ CONFIG_PED$ADMIN_TIME
+    )
+  ) %>%
+  filter(
+    !is.na(time_days),
+    sequence >= 1,
+    sequence <= CONFIG_PED$P_MAX
+  ) %>%
+  mutate(
+    System = factor(
+      System,
+      levels = c(
+        "Current System",
+        "4-Status Counterfactual"
+      )
+    ),
+    
+    WL_ID_CODE =
+      as.character(WL_ID_CODE)
+  )
+
+
+cat("\nOutcome dataset:\n")
+
+cat(
+  "Unique pediatric candidates:",
+  n_distinct(
+    outcome_long_all$WL_ID_CODE
+  ),
+  "\n"
+)
+
+cat(
+  "Rows:",
+  nrow(outcome_long_all),
+  "\n"
+)
+
+cat(
+  "Events by 90 days:",
+  sum(outcome_long_all$event),
+  "\n"
+)
+
+cat(
+  "Controls observed beyond 90 days:",
+  sum(
+    outcome_long_all$event == 0 &
+      outcome_long_all$time_days >
+      CONFIG_PED$T_HORIZON
+  ),
+  "\n"
+)
+
+cat(
+  "Censored before or at 90 days:",
+  sum(
+    outcome_long_all$event == 0 &
+      outcome_long_all$time_days <=
+      CONFIG_PED$T_HORIZON
+  ),
+  "\n"
+)
+
+
+# ── Step 13: Survival-analysis helpers ────────────────────────────
+km_at_horizon <- function(
+    dt_pos,
+    t_horizon
+) {
+  
+  if (nrow(dt_pos) == 0) {
+    return(NULL)
+  }
+  
+  fit <- tryCatch(
+    survfit(
+      Surv(time_days, event) ~ 1,
+      data = dt_pos,
+      conf.type = "log-log"
+    ),
+    error = function(e) NULL
+  )
+  
+  if (is.null(fit)) {
+    return(NULL)
+  }
+  
+  smry <- tryCatch(
+    summary(
+      fit,
+      times = t_horizon,
+      extend = TRUE
+    ),
+    error = function(e) NULL
+  )
+  
+  if (
+    is.null(smry) ||
+    length(smry$surv) == 0
+  ) {
+    return(NULL)
+  }
+  
+  list(
+    mortality = 1 - smry$surv[1],
+    n_candidates = nrow(dt_pos)
+  )
+}
+
+
+deduplicate_candidate_position <- function(
+    dt,
+    seed,
+    cluster_variable = "WL_ID_CODE"
+) {
+  
+  set.seed(seed)
+  
+  dt <- as.data.table(
+    copy(dt)
+  )
+  
+  group_variables <- c(
+    cluster_variable,
+    "System",
+    "sequence"
+  )
+  
+  dt[
+    ,
+    .SD[sample.int(.N, 1L)],
+    by = group_variables
+  ]
+}
+
+
+estimate_km_curve <- function(
+    dt,
+    p_max,
+    n_min,
+    t_horizon
+) {
+  
+  dt <- as.data.table(dt)
+  
+  results <- data.table(
+    position = seq_len(p_max),
+    mortality = NA_real_,
+    n_candidates = NA_integer_
+  )
+  
+  for (p in seq_len(p_max)) {
+    
+    sub <- as.data.frame(
+      dt[sequence == p]
+    )
+    
+    if (nrow(sub) < n_min) {
+      next
+    }
+    
+    res <- km_at_horizon(
+      sub,
+      t_horizon
+    )
+    
+    if (is.null(res)) {
+      next
+    }
+    
+    results[
+      p,
+      `:=`(
+        mortality = res$mortality,
+        n_candidates = res$n_candidates
+      )
+    ]
+  }
+  
+  results
+}
+
+
+estimate_both_systems <- function(
+    dt,
+    p_max,
+    n_min,
+    t_horizon,
+    seed,
+    cluster_variable = "WL_ID_CODE"
+) {
+  
+  dedup <- deduplicate_candidate_position(
+    dt = dt,
+    seed = seed,
+    cluster_variable = cluster_variable
+  )
+  
+  bind_rows(
+    estimate_km_curve(
+      dedup[
+        System == "Current System"
+      ],
+      p_max = p_max,
+      n_min = n_min,
+      t_horizon = t_horizon
+    ) %>%
+      as_tibble() %>%
+      mutate(
+        System = "Current System"
+      ),
+    
+    estimate_km_curve(
+      dedup[
+        System ==
+          "4-Status Counterfactual"
+      ],
+      p_max = p_max,
+      n_min = n_min,
+      t_horizon = t_horizon
+    ) %>%
+      as_tibble() %>%
+      mutate(
+        System =
+          "4-Status Counterfactual"
+      )
+  )
+}
+
+
+calculate_curve_slope <- function(
+    curve_data,
+    p_max = 20
+) {
+  
+  dat <- curve_data %>%
+    filter(
+      position <= p_max,
+      !is.na(mortality)
+    )
+  
+  if (nrow(dat) < 3) {
+    return(NA_real_)
+  }
+  
+  unname(
+    coef(
+      lm(
+        mortality ~ position,
+        data = dat
+      )
+    )[["position"]]
+  )
+}
+
+
+format_boot_p <- function(p) {
+  
+  case_when(
+    is.na(p) ~ NA_character_,
+    p < 0.001 ~ "<0.001",
+    TRUE ~ sprintf("%.3f", p)
+  )
+}
+
+
+# ── Step 14: Point estimates across multiple deduplication draws ──
+cat(
+  "\nRunning",
+  CONFIG_PED$L_POINT,
+  "deduplication draws for point estimates...\n"
+)
+
+
+point_draws <- lapply(
+  seq_len(CONFIG_PED$L_POINT),
+  function(draw_number) {
+    
+    estimate_both_systems(
+      dt = outcome_long_all,
+      p_max = CONFIG_PED$P_MAX,
+      n_min = CONFIG_PED$N_MIN,
+      t_horizon = CONFIG_PED$T_HORIZON,
+      seed =
+        CONFIG_PED$SEED +
+        draw_number,
+      cluster_variable = "WL_ID_CODE"
+    ) %>%
+      mutate(
+        draw = draw_number
+      )
+  }
+) %>%
+  bind_rows()
+
+
+point_curve <- point_draws %>%
+  group_by(
+    System,
+    position
+  ) %>%
+  summarise(
+    km_90 = mean(
+      mortality,
+      na.rm = TRUE
+    ),
+    
+    n_candidates = round(
+      mean(
+        n_candidates,
+        na.rm = TRUE
+      )
+    ),
+    
+    n_draws = sum(
+      !is.na(mortality)
+    ),
+    
+    .groups = "drop"
+  ) %>%
+  mutate(
+    km_90 = if_else(
+      is.nan(km_90),
+      NA_real_,
+      km_90
+    )
+  )
+
+
+cat(
+  "Completed point-estimate draws.\n"
+)
+
+
+# ── Step 15: Paired candidate-clustered bootstrap ─────────────────
+# Each bootstrap sample draws candidates with replacement. Every
+# sampled candidate contributes observations under both allocation
+# systems, preserving the paired comparison.
+
+outcome_dt <- as.data.table(
+  outcome_long_all
+)
+
+setkey(
+  outcome_dt,
+  WL_ID_CODE
+)
+
+unique_ids <- unique(
+  outcome_dt$WL_ID_CODE
+)
+
+
+bootstrap_results <- vector(
+  "list",
+  CONFIG_PED$N_BOOT
+)
+
+bootstrap_errors <- character(
+  CONFIG_PED$N_BOOT
+)
+
+
+cat(
+  "\nRunning paired candidate-clustered bootstrap (n =",
+  CONFIG_PED$N_BOOT,
+  ")...\n"
+)
+
+
+pb <- txtProgressBar(
+  min = 0,
+  max = CONFIG_PED$N_BOOT,
+  style = 3
+)
+
+
+for (
+  bootstrap_iteration in
+  seq_len(CONFIG_PED$N_BOOT)
+) {
+  
+  tryCatch({
+    
+    set.seed(
+      CONFIG_PED$SEED +
+        10000L +
+        bootstrap_iteration
+    )
+    
+    sampled_ids <- sample(
+      unique_ids,
+      size = length(unique_ids),
+      replace = TRUE
+    )
+    
+    bootstrap_id_table <- data.table(
+      WL_ID_CODE = sampled_ids,
+      
+      # Duplicate draws of the same candidate are treated as distinct
+      # bootstrap clusters.
+      boot_cluster = seq_along(
+        sampled_ids
+      )
+    )
+    
+    
+    bootstrap_data <- outcome_dt[
+      bootstrap_id_table,
+      on = "WL_ID_CODE",
+      allow.cartesian = TRUE
+    ]
+    
+    
+    bootstrap_curves <- estimate_both_systems(
+      dt = bootstrap_data,
+      p_max = CONFIG_PED$P_MAX,
+      n_min = CONFIG_PED$N_MIN,
+      t_horizon = CONFIG_PED$T_HORIZON,
+      seed =
+        CONFIG_PED$SEED +
+        20000L +
+        bootstrap_iteration,
+      cluster_variable = "boot_cluster"
+    )
+    
+    
+    bootstrap_slopes <- bootstrap_curves %>%
+      group_by(System) %>%
+      summarise(
+        trend_slope = calculate_curve_slope(
+          pick(everything()),
+          p_max = CONFIG_PED$TREND_P_MAX
+        ),
+        .groups = "drop"
+      )
+    
+    
+    bootstrap_results[[
+      bootstrap_iteration
+    ]] <- bootstrap_curves %>%
+      left_join(
+        bootstrap_slopes,
+        by = "System"
+      ) %>%
+      mutate(
+        iteration =
+          bootstrap_iteration
+      )
+    
+  }, error = function(e) {
+    
+    bootstrap_errors[
+      bootstrap_iteration
+    ] <<- conditionMessage(e)
+    
+  })
+  
+  setTxtProgressBar(
+    pb,
+    bootstrap_iteration
+  )
+}
+
+
+close(pb)
+
+
+bootstrap_long <- bind_rows(
+  bootstrap_results
+)
+
+
+successful_iterations <- n_distinct(
+  bootstrap_long$iteration
+)
+
+
+cat(
+  "\nSuccessful bootstrap iterations:",
+  successful_iterations,
+  "/",
+  CONFIG_PED$N_BOOT,
+  "\n"
+)
+
+
+if (
+  successful_iterations <
+  0.95 * CONFIG_PED$N_BOOT
+) {
+  warning(
+    paste0(
+      "Fewer than 95% of bootstrap iterations succeeded: ",
+      successful_iterations,
+      " of ",
+      CONFIG_PED$N_BOOT,
+      "."
+    )
+  )
+}
+
+
+if (any(nzchar(bootstrap_errors))) {
+  
+  cat("\nBootstrap failure reasons:\n")
+  
+  print(
+    sort(
+      table(
+        bootstrap_errors[
+          nzchar(bootstrap_errors)
+        ]
+      ),
+      decreasing = TRUE
+    )
+  )
+}
+
+
+# ── Step 16: Bootstrap CIs for each system ────────────────────────
+alpha <- 1 -
+  CONFIG_PED$CONF_LEVEL
+
+
+curve_boot_summary <- bootstrap_long %>%
+  filter(
+    !is.na(mortality)
+  ) %>%
+  group_by(
+    System,
+    position
+  ) %>%
+  summarise(
+    km_90_lower = quantile(
+      mortality,
+      alpha / 2,
+      na.rm = TRUE
+    ),
+    
+    km_90_upper = quantile(
+      mortality,
+      1 - alpha / 2,
+      na.rm = TRUE
+    ),
+    
+    n_boot_position = n(),
+    
+    .groups = "drop"
+  )
+
+
+obs_km_seq_all <- point_curve %>%
+  left_join(
+    curve_boot_summary,
+    by = c(
+      "System",
+      "position"
+    )
+  ) %>%
+  transmute(
+    System = factor(
+      System,
+      levels = c(
+        "Current System",
+        "4-Status Counterfactual"
+      )
+    ),
+    
+    sequence = position,
+    km_90,
+    km_90_lower,
+    km_90_upper,
+    n_candidates,
+    n_draws,
+    n_boot_position
+  )
+
+
+cat("\nKey position-specific estimates:\n")
+
+obs_km_seq_all %>%
+  filter(
+    sequence %in%
+      c(1, 2, 3, 5, 10, 20, 50)
+  ) %>%
+  mutate(
+    across(
+      c(
+        km_90,
+        km_90_lower,
+        km_90_upper
+      ),
+      ~ round(.x * 100, 1)
+    )
+  ) %>%
+  print()
+
+
+# ── Step 17: Paired pointwise differences ─────────────────────────
+bootstrap_wide <- bootstrap_long %>%
+  dplyr::select(
+    iteration,
+    System,
+    position,
+    mortality
+  ) %>%
+  pivot_wider(
+    names_from = System,
+    values_from = mortality
+  ) %>%
+  mutate(
+    diff =
+      `4-Status Counterfactual` -
+      `Current System`
+  )
+
+
+point_diff <- point_curve %>%
+  dplyr::select(
+    System,
+    position,
+    km_90
+  ) %>%
+  pivot_wider(
+    names_from = System,
+    values_from = km_90
+  ) %>%
+  mutate(
+    diff =
+      `4-Status Counterfactual` -
+      `Current System`
+  )
+
+
+curve_diff <- bootstrap_wide %>%
+  filter(
+    position <=
+      CONFIG_PED$TREND_P_MAX,
+    !is.na(diff)
+  ) %>%
+  group_by(position) %>%
+  summarise(
+    lower_diff = quantile(
+      diff,
+      alpha / 2,
+      na.rm = TRUE
+    ),
+    
+    upper_diff = quantile(
+      diff,
+      1 - alpha / 2,
+      na.rm = TRUE
+    ),
+    
+    # Finite-sample corrected, two-sided paired bootstrap p-value.
+    p_lower = (
+      1 + sum(
+        diff <= 0,
+        na.rm = TRUE
+      )
+    ) / (
+      1 + sum(
+        !is.na(diff)
+      )
+    ),
+    
+    p_upper = (
+      1 + sum(
+        diff >= 0,
+        na.rm = TRUE
+      )
+    ) / (
+      1 + sum(
+        !is.na(diff)
+      )
+    ),
+    
+    p_value = pmin(
+      1,
+      2 * pmin(
+        p_lower,
+        p_upper
+      )
+    ),
+    
+    n_boot = sum(
+      !is.na(diff)
+    ),
+    
+    .groups = "drop"
+  ) %>%
+  left_join(
+    point_diff %>%
+      dplyr::select(
+        position,
+        diff
+      ),
+    by = "position"
+  ) %>%
+  mutate(
+    diff_pct =
+      round(diff * 100, 1),
+    
+    lower_diff_pct =
+      round(
+        lower_diff * 100,
+        1
+      ),
+    
+    upper_diff_pct =
+      round(
+        upper_diff * 100,
+        1
+      ),
+    
+    p_fmt =
+      format_boot_p(p_value)
+  )
+
+
+cat(
+  "\nPaired difference in 90-day mortality ",
+  "(counterfactual minus current):\n",
+  sep = ""
+)
+
+curve_diff %>%
+  dplyr::select(
+    position,
+    diff_pct,
+    lower_diff_pct,
+    upper_diff_pct,
+    p_fmt,
+    n_boot
+  ) %>%
+  print(
+    n = CONFIG_PED$TREND_P_MAX
+  )
+
+
+# ── Step 18: Bootstrap mortality-gradient test ────────────────────
+# The test evaluates whether mortality decreases as numerical sequence
+# position increases from 1 through 20.
+#
+# A negative slope indicates higher mortality nearer the top of the
+# match run and progressively lower mortality at later positions.
+
+point_slopes <- point_draws %>%
+  filter(
+    position <=
+      CONFIG_PED$TREND_P_MAX
+  ) %>%
+  group_by(
+    draw,
+    System
+  ) %>%
+  summarise(
+    trend_slope = calculate_curve_slope(
+      pick(everything()),
+      p_max = CONFIG_PED$TREND_P_MAX
+    ),
+    .groups = "drop"
+  ) %>%
+  group_by(System) %>%
+  summarise(
+    trend_slope =
+      mean(
+        trend_slope,
+        na.rm = TRUE
+      ),
+    .groups = "drop"
+  )
+
+
+bootstrap_slopes <- bootstrap_long %>%
+  dplyr::select(
+    iteration,
+    System,
+    trend_slope
+  ) %>%
+  distinct() %>%
+  filter(
+    !is.na(trend_slope)
+  )
+
+
+trend_results <- bootstrap_slopes %>%
+  group_by(System) %>%
+  summarise(
+    slope_lower = quantile(
+      trend_slope,
+      alpha / 2,
+      na.rm = TRUE
+    ),
+    
+    slope_upper = quantile(
+      trend_slope,
+      1 - alpha / 2,
+      na.rm = TRUE
+    ),
+    
+    # One-sided bootstrap p-value for:
+    # H0: slope >= 0
+    # HA: slope < 0
+    p_value = (
+      1 + sum(
+        trend_slope >= 0,
+        na.rm = TRUE
+      )
+    ) / (
+      1 + sum(
+        !is.na(trend_slope)
+      )
+    ),
+    
+    n_boot = n(),
+    
+    .groups = "drop"
+  ) %>%
+  left_join(
+    point_slopes,
+    by = "System"
+  ) %>%
+  mutate(
+    p_fmt =
+      format_boot_p(p_value)
+  )
+
+
+cat(
+  "\n=== BOOTSTRAP MORTALITY-GRADIENT TEST ===\n"
+)
+
+cat(
+  "Alternative hypothesis: mortality decreases as sequence position increases.\n"
+)
+
+trend_results %>%
+  print()
+
+
+
+  # ── Paired bootstrap test: is the counterfactual slope steeper? ───
+  # H0: beta_CF - beta_Current >= 0
+  # HA: beta_CF - beta_Current < 0
+  
+  slope_diff_boot <- bootstrap_slopes %>%
+  dplyr::select(
+    iteration,
+    System,
+    trend_slope
+  ) %>%
+  pivot_wider(
+    names_from  = System,
+    values_from = trend_slope
+  ) %>%
+  filter(
+    !is.na(`Current System`),
+    !is.na(`4-Status Counterfactual`)
+  ) %>%
+  mutate(
+    slope_diff =
+      `4-Status Counterfactual` -
+      `Current System`
+  )
+
+
+# Observed slope difference from the point estimates
+observed_slope_diff <- point_slopes %>%
+  dplyr::select(
+    System,
+    trend_slope
+  ) %>%
+  pivot_wider(
+    names_from  = System,
+    values_from = trend_slope
+  ) %>%
+  transmute(
+    slope_diff =
+      `4-Status Counterfactual` -
+      `Current System`
+  ) %>%
+  pull(slope_diff)
+
+
+# Paired bootstrap confidence interval and one-sided p-value
+slope_diff_results <- slope_diff_boot %>%
+  summarise(
+    observed_slope_diff = observed_slope_diff,
+    
+    lower_95 = quantile(
+      slope_diff,
+      0.025,
+      na.rm = TRUE
+    ),
+    
+    upper_95 = quantile(
+      slope_diff,
+      0.975,
+      na.rm = TRUE
+    ),
+    
+    # One-sided paired bootstrap test:
+    # count how often the counterfactual is not steeper
+    p_value = (
+      1 + sum(
+        slope_diff >= 0,
+        na.rm = TRUE
+      )
+    ) / (
+      1 + sum(
+        !is.na(slope_diff)
+      )
+    ),
+    
+    n_boot = sum(
+      !is.na(slope_diff)
+    )
+  ) %>%
+  mutate(
+    # Convert slope difference to percentage points per position
+    slope_diff_pp_per_position =
+      observed_slope_diff * 100,
+    
+    lower_95_pp_per_position =
+      lower_95 * 100,
+    
+    upper_95_pp_per_position =
+      upper_95 * 100,
+    
+    # Additional fitted mortality separation across positions 1–20
+    additional_decline_1_to_20 =
+      -observed_slope_diff *
+      (CONFIG_PED$TREND_P_MAX - 1),
+    
+    additional_decline_1_to_20_pct =
+      additional_decline_1_to_20 * 100,
+    
+    p_fmt = case_when(
+      p_value < 0.001 ~ "<0.001",
+      TRUE            ~ sprintf("%.3f", p_value)
+    )
+  )
+
+
+cat(
+  "\n=== PAIRED BOOTSTRAP COMPARISON OF MORTALITY GRADIENTS ===\n"
+)
+
+cat(
+  "Alternative hypothesis: the counterfactual slope is more negative.\n"
+)
+
+slope_diff_results %>%
+  print()
+
+
+
+cat(
+  "\nObserved slope difference (CF - Current):",
+  round(
+    slope_diff_results$slope_diff_pp_per_position,
+    3
+  ),
+  "percentage points per position\n"
+)
+
+cat(
+  "95% bootstrap CI:",
+  round(
+    slope_diff_results$lower_95_pp_per_position,
+    3
+  ),
+  "to",
+  round(
+    slope_diff_results$upper_95_pp_per_position,
+    3
+  ),
+  "percentage points per position\n"
+)
+
+cat(
+  "One-sided paired bootstrap p-value:",
+  slope_diff_results$p_fmt,
+  "\n"
+)
+
+cat(
+  "Additional fitted decline from positions 1 to",
+  CONFIG_PED$TREND_P_MAX,
+  ":",
+  round(
+    slope_diff_results$additional_decline_1_to_20_pct,
+    2
+  ),
+  "percentage points\n"
+)
+
+# ── Step 19: Median acceptance position ───────────────────────────
+median_accept_all <- ptr_all_ped %>%
+  filter(
+    OFFER_ACCEPT == "Y"
+  ) %>%
+  summarise(
+    median_position = median(
+      PTR_SEQUENCE_NUM,
+      na.rm = TRUE
+    )
+  ) %>%
+  pull(median_position)
+
+
+cat("\nAccepted-offer sequence positions:\n")
+
+ptr_all_ped %>%
+  filter(
+    OFFER_ACCEPT == "Y"
+  ) %>%
+  summarise(
+    median = median(
+      PTR_SEQUENCE_NUM,
+      na.rm = TRUE
+    ),
+    
+    q25 = quantile(
+      PTR_SEQUENCE_NUM,
+      0.25,
+      na.rm = TRUE
+    ),
+    
+    q75 = quantile(
+      PTR_SEQUENCE_NUM,
+      0.75,
+      na.rm = TRUE
+    )
+  ) %>%
+  print()
+
+
+# ── Step 20: Summary table ────────────────────────────────────────
+cat("\nMortality at key sequence positions:\n")
+
+obs_km_seq_all %>%
+  filter(
+    sequence %in%
+      c(1, 2, 3, 5, 10, 20)
+  ) %>%
+  mutate(
+    across(
+      c(
+        km_90,
+        km_90_lower,
+        km_90_upper
+      ),
+      ~ round(.x * 100, 1)
+    )
+  ) %>%
+  dplyr::select(
+    System,
+    sequence,
+    km_90,
+    km_90_lower,
+    km_90_upper
+  ) %>%
+  arrange(
+    System,
+    sequence
+  ) %>%
+  print()
+
+
+# ── Step 21: Significance markers ─────────────────────────────────
+sig_positions <- curve_diff %>%
+  filter(
+    p_value < 0.05
+  ) %>%
+  left_join(
+    obs_km_seq_all %>%
+      filter(
+        System ==
+          "4-Status Counterfactual"
+      ) %>%
+      dplyr::select(
+        sequence,
+        km_90_upper
+      ),
+    by = c(
+      "position" = "sequence"
+    )
+  ) %>%
+  mutate(
+    y_star =
+      km_90_upper +
+      0.005
+  )
+
+
+# ── Step 22: Plot ─────────────────────────────────────────────────
+fig_km_position <- ggplot(
+  obs_km_seq_all,
+  aes(
+    x = sequence,
+    y = km_90,
+    color = System,
+    fill = System
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = km_90_lower,
+      ymax = km_90_upper
+    ),
+    alpha = 0.15,
+    color = NA
+  ) +
+  geom_point(
+    size = 1.5,
+    alpha = 0.8
+  ) +
+  geom_line(
+    linewidth = 0.8
+  ) +
+  geom_vline(
+    aes(
+      xintercept =
+        median_accept_all,
+      linetype =
+        "Median Acceptance Position"
+    ),
+    color = "black",
+    linewidth = 0.8
+  ) +
+  geom_text(
+    data = sig_positions,
+    aes(
+      x = position,
+      y = y_star
+    ),
+    label = "*",
+    size = 7,
+    color = "black",
+    fontface = "bold",
+    inherit.aes = FALSE
+  ) +
+  scale_color_manual(
+    values = c(
+      "Current System" = "#374e55",
+      "4-Status Counterfactual" = "#b24745"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Current System" = "#374e55",
+      "4-Status Counterfactual" = "#b24745"
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "Median Acceptance Position" =
+        "dashed"
+    ),
+    name = NULL
+  ) +
+  scale_y_continuous(
+    labels =
+      scales::percent_format(
+        accuracy = 0.1
+      )
+  ) +
+  scale_x_continuous(
+    breaks = seq(
+      1,
+      CONFIG_PED$TREND_P_MAX,
+      1
+    )
+  ) +
+  coord_cartesian(
+    xlim = c(
+      1,
+      CONFIG_PED$TREND_P_MAX
+    )
+  ) +
+  guides(
+    color =
+      guide_legend(
+        nrow = 1,
+        order = 1
+      ),
+    
+    fill =
+      guide_legend(
+        nrow = 1,
+        order = 1
+      ),
+    
+    linetype =
+      guide_legend(
+        nrow = 1,
+        order = 2
+      )
+  ) +
+  labs(
+    x =
+      "Match Run Sequence Position",
+    
+    y =
+      "90-Day Rate of Death or Deterioration",
+    
+    color =
+      "Allocation System",
+    
+    fill =
+      "Allocation System"
+  ) +
+  theme_classic(
+    base_size = 16
+  ) +
+  theme(
+    axis.text =
+      element_text(
+        size = 15
+      ),
+    
+    axis.title =
+      element_text(
+        size = 15
+      ),
+    
+    legend.text =
+      element_text(
+        size = 15
+      ),
+    
+    legend.title =
+      element_text(
+        face = "bold",
+        size = 15
+      ),
+    
+    legend.position =
+      "bottom",
+    
+    legend.box =
+      "vertical",
+    
+    panel.grid.major.y =
+      element_line(
+        color = "gray90",
+        linewidth = 0.3
+      )
+  )
+
+
+print(fig_km_position)
+
+
+# ── Step 23: GT results table ─────────────────────────────────────
+library(gt)
+
+
+results_table <- obs_km_seq_all %>%
+  filter(
+    sequence <=
+      CONFIG_PED$TREND_P_MAX
+  ) %>%
+  mutate(
+    est_ci = sprintf(
+      "%.1f%% (%.1f–%.1f%%)",
+      km_90 * 100,
+      km_90_lower * 100,
+      km_90_upper * 100
+    )
+  ) %>%
+  dplyr::select(
+    System,
+    sequence,
+    est_ci
+  ) %>%
+  pivot_wider(
+    names_from = System,
+    values_from = est_ci
+  ) %>%
+  left_join(
+    curve_diff %>%
+      dplyr::select(
+        position,
+        p_fmt
+      ),
+    by = c(
+      "sequence" = "position"
+    )
+  ) %>%
+  gt() %>%
+  cols_label(
+    sequence =
+      "Sequence",
+    
+    `Current System` =
+      "Current System",
+    
+    `4-Status Counterfactual` =
+      "4-Status Counterfactual",
+    
+    p_fmt =
+      "P Value"
+  ) %>%
+  tab_header(
+    title =
+      "90-Day Mortality by Match Run Sequence Position",
+    
+    subtitle =
+      "Current and 4-status counterfactual allocation systems, 2019–2024"
+  ) %>%
+  tab_footnote(
+    footnote =
+      "Confidence intervals and P values were estimated using paired candidate-clustered bootstrap resampling.",
+    
+    locations =
+      cells_column_labels(
+        columns = p_fmt
+      )
+  )
+
+
+results_table
+
+
+```
+
